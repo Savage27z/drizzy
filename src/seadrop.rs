@@ -245,11 +245,11 @@ mod tests {
         let mut words = Vec::with_capacity(6 * 32);
         for (value, width) in [
             (mint_price, 80usize),
-            (start_time as u128, 48),
-            (end_time as u128, 48),
-            (max_total as u128, 16),
-            (fee_bps as u128, 16),
-            (restrict as u128, 8),
+            (u128::from(start_time), 48),
+            (u128::from(end_time), 48),
+            (u128::from(max_total), 16),
+            (u128::from(fee_bps), 16),
+            (u128::from(restrict), 8),
         ] {
             let mut word = vec![0u8; 32];
             let value_bytes = value.to_be_bytes();
@@ -270,7 +270,7 @@ mod tests {
             250,
             true,
         );
-        let result = Bytes::from(payload);
+        let result = payload;
 
         let words = result.as_ref();
         assert!(words.len() >= 6 * 32);

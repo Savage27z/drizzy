@@ -241,6 +241,62 @@ cargo build --release --locked
 
 ---
 
+<h2 align="center">Deploy on Railway</h2>
+
+The repository ships a multi-stage `Dockerfile` (auto-detected by Railway) plus a
+`railway.toml` that runs the bot as a worker. No public domain or port is
+needed — the bot long-polls Telegram, so there is nothing to expose.
+
+### 1. Create the service
+
+1. Push `Savage27z/drizzy` to GitHub.
+2. Railway: **New Project → Deploy from GitHub repo** → pick `drizzy`.
+3. The Dockerfile builds automatically. First build compiles every Rust
+   dependency (~10 min, `aws-lc-sys` is the heavy one); redeploys only rebuild
+   drizzy itself (~2 min) thanks to the cached builder stage.
+
+### 2. Add a Volume
+
+Mount a Railway **Volume** at `/data` so the wallet manifest survives restarts
+and redeploys. Set `WALLETS_FILE=/data/wallets.json` (the manifest path is
+already env-configurable — no code change needed).
+
+### 3. Environment variables
+
+| Setting | Required | Purpose |
+| --- | --- | --- |
+| `BOT_TOKEN` | ✅ | Bot token from [@BotFather](https://t.me/BotFather). |
+| `ALLOWED_CHAT_IDS` | ✅ | Comma-separated numeric chat ids (from [@userinfobot](https://t.me/userinfobot)); every other chat is ignored. |
+| `RPC_URL_BOT` | ✅ | Comma-separated RPC endpoints for bot snipes (falls back to `RPC_URL`, then per-chain public nodes). Use a paid node for best T-0 latency. |
+| `WALLETS_FILE` | ✅ | `/data/wallets.json` (volume). |
+| `FEE_AUTOMATIC` / `GAS_LIMIT` | as needed | Inherited from `.env.example` defaults if unset; see Configuration. |
+
+### 4. First wallet setup
+
+Either generate a manifest from the Railway shell, or upload one in chat:
+
+```bash
+# Railway service shell (writes into the persistent volume)
+opensea-mint wallets create --count 5 --quantity 1 --output /data/wallets.json
+```
+
+Then send the `wallets.json` file to the bot chat (upload import) — keys are
+stored server-side and never appear in chat history.
+
+### 5. Run
+
+`railway.toml` starts `opensea-mint bot` automatically. Watch the service logs:
+a successful start prints the bot username and the owner-only guard message.
+Send `/help` from your allowed chat id to verify.
+
+> [!NOTE]
+> Build memory is capped at 2 parallel cargo jobs in the Dockerfile
+> (`CARGO_BUILD_JOBS=2`) so `aws-lc-sys` does not OOM a small Railway builder.
+> If the build still runs out of memory, lower it to `1` in the Dockerfile
+> builder stage.
+
+---
+
 <h2 align="center">Available Commands</h2>
 
 `wallets create` does not load `.env`; help and version output also exit before configuration is loaded. All operational network commands use the active `.env`.

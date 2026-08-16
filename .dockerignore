@@ -1,0 +1,8 @@
+.git
+target
+contracts/cache
+contracts/out
+.env
+wallets.json
+wallets.example.json
+foundry.toml

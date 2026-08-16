@@ -1,0 +1,7 @@
+# Railway deployment config: Dockerfile is auto-detected.
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+# Long-polling bot — no HTTP port to expose, run it as a worker.
+startCommand = "opensea-mint bot"
