@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "wallets": [
+    {
+      "private_key": "0x<64-hex-character-eligible-wallet-private-key>",
+      "quantity": 1
+    }
+  ]
+}

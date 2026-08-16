@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title description">
+  <title id="title">OSNM-Z Mint Bot</title>
+  <desc id="description">A friendly sea-blue bot with a mint token antenna.</desc>
+  <defs>
+    <linearGradient id="body" x1="25" y1="36" x2="105" y2="109" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22d3ee" />
+      <stop offset="1" stop-color="#2563eb" />
+    </linearGradient>
+  </defs>
+  <rect x="17" y="39" width="94" height="76" rx="28" fill="#071524" stroke="#164e63" stroke-width="4" />
+  <rect x="25" y="47" width="78" height="57" rx="21" fill="url(#body)" />
+  <path d="M64 39V24" stroke="#67e8f9" stroke-linecap="round" stroke-width="6" />
+  <circle cx="64" cy="18" r="10" fill="#fbbf24" stroke="#fef3c7" stroke-width="3" />
+  <circle cx="48" cy="70" r="8" fill="#eff6ff" />
+  <circle cx="80" cy="70" r="8" fill="#eff6ff" />
+  <circle cx="48" cy="70" r="3" fill="#0f172a" />
+  <circle cx="80" cy="70" r="3" fill="#0f172a" />
+  <path d="M44 89c11 8 29 8 40 0" fill="none" stroke="#ecfeff" stroke-linecap="round" stroke-width="6" />
+  <path d="M17 68H9M119 68h-8" stroke="#38bdf8" stroke-linecap="round" stroke-width="6" />
+</svg>

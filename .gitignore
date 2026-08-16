@@ -1,0 +1,5 @@
+/target/
+/contracts/cache/
+/contracts/out/
+.env
+/wallets.json

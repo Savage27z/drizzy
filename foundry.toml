@@ -1,0 +1,20 @@
+[profile.default]
+src = "contracts/src"
+test = "contracts/test"
+script = "contracts/script"
+out = "contracts/out"
+cache_path = "contracts/cache"
+solc_version = "0.8.36"
+evm_version = "prague"
+optimizer = true
+optimizer_runs = 10000
+via_ir = true
+bytecode_hash = "none"
+deny = "warnings"
+
+[fuzz]
+runs = 1000
+
+[invariant]
+runs = 256
+depth = 64
