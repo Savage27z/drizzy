@@ -1,6 +1,10 @@
 # syntax=docker/dockerfile:1
 # ---------- builder ----------
-FROM rust:1.97-bookworm AS builder
+# Pinned to the exact channel in rust-toolchain.toml. rust-toolchain.toml is
+# intentionally NOT copied into the image — it would make rustup download a
+# second toolchain at build time; matching the base image is both faster and
+# reproducible, and it guarantees the Cargo.toml `rust-version` floor is met.
+FROM rust:1.97.1-bookworm AS builder
 
 # aws-lc-sys (rustls/aws-lc-rs) needs a C toolchain, cmake, clang (bindgen) and perl
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -26,11 +30,13 @@ RUN mkdir -p src \
     && : > src/lib.rs \
     && cargo build --release --locked
 
-# Phase 2: real source. contracts/ is required (executor creation hex is
-# include_str!-ed); README.md + .env.example are include_str!-ed in tests.
+# Phase 2: real source. contracts/ is required — the executor creation hex is
+# include_str!-ed from non-test code. README.md and .env.example are only
+# include_str!-ed under #[cfg(test)], and this stage runs `cargo build`, never
+# `cargo test`, so they are deliberately not copied: doing so would invalidate
+# this layer (and force a full recompile) on every docs-only commit.
 COPY src ./src
 COPY contracts ./contracts
-COPY README.md .env.example ./
 RUN touch src/main.rs src/lib.rs \
     && cargo build --release --locked
 

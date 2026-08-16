@@ -349,11 +349,30 @@ async fn run_probe(
     candidates: &[Url],
     expected_chain_id: Option<u64>,
 ) -> Result<(u64, Vec<Url>), SnipeError> {
+    // Probe every candidate concurrently: a dead endpoint costs a full request
+    // timeout, and serialising them made startup scale with the number of dead
+    // RPCs. Results are collected in candidate order so endpoint priority (and
+    // therefore the primary read RPC) stays deterministic.
+    let handles: Vec<JoinHandle<Result<u64, ()>>> = candidates
+        .iter()
+        .map(|url| {
+            let gateway = gateway.clone();
+            let url = url.clone();
+            tokio::spawn(async move {
+                gateway
+                    .probe_rpc(&url)
+                    .await
+                    .map(|p| p.chain_id)
+                    .map_err(|_| ())
+            })
+        })
+        .collect();
+
     let mut probed: Vec<(Url, u64)> = Vec::new();
-    for url in candidates {
-        match gateway.probe_rpc(url).await {
-            Ok(probe) => probed.push((url.clone(), probe.chain_id)),
-            Err(_) => logging::warn(format!("RPC {url} unreachable — dropped")),
+    for (url, handle) in candidates.iter().zip(handles) {
+        match handle.await {
+            Ok(Ok(chain_id)) => probed.push((url.clone(), chain_id)),
+            _ => logging::warn(format!("RPC {url} unreachable — dropped")),
         }
     }
     if probed.is_empty() {
@@ -796,11 +815,31 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
 
     // ── Per-wallet balance + nonce, pre-sign everything ──
     emit_info!("Checking balances and signing...");
+    // Balance/nonce reads are independent per wallet, so fan them out — this
+    // used to be one serial round trip per wallet, which is what made a large
+    // manifest slow to arm. Results are awaited in wallet order so the first
+    // failing wallet is still the one reported.
+    let state_handles: Vec<JoinHandle<Result<AccountState, ChainError>>> = plans
+        .iter()
+        .map(|(signer, _, _)| {
+            let gateway = gateway.clone();
+            let config = config.clone();
+            let address = signer.identity().address;
+            tokio::spawn(async move { gateway.account_state(&config, 1, address).await })
+        })
+        .collect();
+
+    let mut accounts: Vec<AccountState> = Vec::with_capacity(state_handles.len());
+    for handle in state_handles {
+        accounts.push(
+            handle
+                .await
+                .map_err(|_| ChainError::WalletSnapshotChanged)??,
+        );
+    }
+
     let mut prepared: Vec<PreparedWallet> = Vec::new();
-    for (index, (signer, _quantity, plan)) in plans.iter().enumerate() {
-        let account: AccountState = gateway
-            .account_state(&config, 1, signer.identity().address)
-            .await?;
+    for ((index, (signer, _quantity, plan)), account) in plans.iter().enumerate().zip(accounts) {
         let required = plan
             .value
             .checked_add(

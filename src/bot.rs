@@ -39,6 +39,10 @@ const API_BASE: &str = "https://api.telegram.org/bot";
 const POLL_TIMEOUT_SECONDS: u64 = 25;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(70);
 const DEFAULT_WALLETS_FILE: &str = "wallets.json";
+/// Roughly a minute of tolerance for a rolling redeploy's old container to
+/// finish draining before this instance declares the token contended.
+const CONFLICT_MAX_ATTEMPTS: u32 = 12;
+const CONFLICT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
 pub enum BotError {
@@ -130,6 +134,14 @@ impl Bot {
         self.allowed.contains(&chat_id)
     }
 
+    /// `reqwest::Error` renders as `... for url (https://api.telegram.org/bot<TOKEN>/...)`,
+    /// so every transport error would otherwise print the bot token into the
+    /// logs. Railway retains deploy logs, so scrub it before it is ever
+    /// formatted.
+    fn redact(&self, error: &reqwest::Error) -> String {
+        error.to_string().replace(self.token.as_str(), "<redacted>")
+    }
+
     async fn api(&self, method: &str, params: Value) -> Result<Value, BotError> {
         let url = format!("{API_BASE}{}/{}", self.token, method);
         let response = self
@@ -138,11 +150,11 @@ impl Bot {
             .json(&params)
             .send()
             .await
-            .map_err(|error| BotError::Telegram(error.to_string()))?;
+            .map_err(|error| BotError::Telegram(self.redact(&error)))?;
         let value: Value = response
             .json()
             .await
-            .map_err(|error| BotError::Telegram(error.to_string()))?;
+            .map_err(|error| BotError::Telegram(self.redact(&error)))?;
         if value.get("ok").and_then(Value::as_bool) != Some(true) {
             let description = value
                 .get("description")
@@ -214,10 +226,10 @@ impl Bot {
             .get(&url)
             .send()
             .await
-            .map_err(|error| BotError::Telegram(error.to_string()))?
+            .map_err(|error| BotError::Telegram(self.redact(&error)))?
             .bytes()
             .await
-            .map_err(|error| BotError::Telegram(error.to_string()))?;
+            .map_err(|error| BotError::Telegram(self.redact(&error)))?;
         std::fs::write(destination, bytes).map_err(|error| {
             BotError::Telegram(format!("cannot write {}: {error}", destination.display()))
         })
@@ -276,9 +288,11 @@ pub async fn run_bot() -> Result<(), BotError> {
     logging::section_break();
 
     let mut offset: i64 = 0;
+    let mut conflicts: u32 = 0;
     loop {
         match bot.get_updates(offset).await {
             Ok(updates) => {
+                conflicts = 0;
                 for update in updates {
                     if let Some(update_id) = update.get("update_id").and_then(Value::as_i64) {
                         offset = update_id + 1;
@@ -286,11 +300,27 @@ pub async fn run_bot() -> Result<(), BotError> {
                     handle_update(&bot, update).await;
                 }
             }
+            // A rolling redeploy briefly runs the old and new container at
+            // once, and the loser sees 409 Conflict. Exiting Ok here would
+            // report success to the platform and leave no bot polling at all,
+            // so wait for the predecessor to drain and only give up — loudly,
+            // with a failing exit code — if it never does.
             Err(BotError::TelegramApi(error)) if error.contains("Conflict") => {
-                logging::error("another bot instance is polling with this token — stop it first");
-                return Ok(());
+                conflicts += 1;
+                if conflicts > CONFLICT_MAX_ATTEMPTS {
+                    logging::error(
+                        "another bot instance is still polling with this token — stop it first",
+                    );
+                    return Err(BotError::TelegramApi(error));
+                }
+                logging::warn(format!(
+                    "another instance is polling this token — retrying in {}s ({conflicts}/{CONFLICT_MAX_ATTEMPTS})",
+                    CONFLICT_RETRY_DELAY.as_secs()
+                ));
+                sleep(CONFLICT_RETRY_DELAY).await;
             }
             Err(error) => {
+                conflicts = 0;
                 logging::warn(format!("getUpdates failed: {error} — retrying in 3s"));
                 sleep(Duration::from_secs(3)).await;
             }

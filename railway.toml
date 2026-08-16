@@ -5,3 +5,9 @@ builder = "DOCKERFILE"
 [deploy]
 # Long-polling bot — no HTTP port to expose, run it as a worker.
 startCommand = "opensea-mint bot"
+
+# The bot loop never terminates on purpose, so any exit is a fault worth
+# restarting: a lost Telegram connection, or a getUpdates conflict that
+# outlived a rolling redeploy.
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

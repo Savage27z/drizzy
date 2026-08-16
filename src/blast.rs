@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use alloy_primitives::B256;
-use reqwest::Client;
+use reqwest::{Client, header::CONTENT_TYPE};
 use serde_json::json;
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -91,28 +91,42 @@ pub fn prepare_blast(signed: &SignedTransaction) -> PreparedBlast {
     }
 }
 
+/// Capped well under the client timeout: a single unresponsive endpoint must
+/// never delay the fire moment, and a handshake that has not completed by then
+/// would not have been useful anyway.
+const WARM_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Pre-establish TCP/TLS to every RPC so the first real request doesn't pay
 /// for a handshake. Some endpoints (Base's sequencer, for one) only accept
 /// send methods, so we warm with `eth_sendRawTransaction` and ignore the
-/// error — the handshake is the point, not the response.
+/// error — the handshake is the point, not the response. Every endpoint is
+/// warmed concurrently: serialising them made arming scale with the slowest RPC.
 pub async fn warm_connections(client: &Client, endpoints: &[RpcEndpoint]) {
-    let futures = endpoints.iter().map(|endpoint| {
-        let client = client.clone();
-        let url = endpoint.url.clone();
-        async move {
-            let _ = client
-                .post(url)
-                .json(&json!({
-                    "jsonrpc": "2.0",
-                    "method": "eth_sendRawTransaction",
-                    "params": ["0x00"],
-                    "id": 1,
-                }))
-                .send()
+    let handles: Vec<JoinHandle<()>> = endpoints
+        .iter()
+        .map(|endpoint| {
+            let client = client.clone();
+            let url = endpoint.url.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(
+                    WARM_TIMEOUT,
+                    client
+                        .post(url)
+                        .json(&json!({
+                            "jsonrpc": "2.0",
+                            "method": "eth_sendRawTransaction",
+                            "params": ["0x00"],
+                            "id": 1,
+                        }))
+                        .send(),
+                )
                 .await;
-        }
-    });
-    futures_join_all(futures).await;
+            })
+        })
+        .collect();
+    for handle in handles {
+        let _ = handle.await;
+    }
 }
 
 /// Blast a prepared raw tx to all RPC endpoints simultaneously — fire and
@@ -136,39 +150,60 @@ pub fn blast_to_all(
             let label = endpoint.label.clone();
             let body = body.clone();
             tokio::spawn(async move {
-                let response = client.post(url).body(body).send().await;
+                // `body()` sets no Content-Type. Geth/reth reject a JSON-RPC
+                // POST without `application/json` with HTTP 415, so the header
+                // is mandatory here — `json()` sets it for us elsewhere, this
+                // is the one call site that serialises ahead of time.
+                let response = client
+                    .post(url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .send()
+                    .await;
                 match response {
-                    Ok(response) => match response.json::<serde_json::Value>().await {
-                        Ok(json) => {
-                            if let Some(result) = json.get("result").and_then(|v| v.as_str()) {
-                                let tx_hash = result
-                                    .parse()
-                                    .ok()
-                                    .filter(|hash: &B256| *hash == expected_hash);
-                                return BlastResult {
+                    Ok(response) => {
+                        let status = response.status();
+                        match response.json::<serde_json::Value>().await {
+                            Ok(json) => {
+                                if let Some(result) = json.get("result").and_then(|v| v.as_str()) {
+                                    let tx_hash = result
+                                        .parse()
+                                        .ok()
+                                        .filter(|hash: &B256| *hash == expected_hash);
+                                    return BlastResult {
+                                        label,
+                                        tx_hash,
+                                        error: None,
+                                    };
+                                }
+                                let error = json
+                                    .get("error")
+                                    .and_then(|v| v.get("message"))
+                                    .and_then(|v| v.as_str())
+                                    .map_or_else(
+                                        || format!("unknown RPC error (HTTP {status})"),
+                                        ToOwned::to_owned,
+                                    );
+                                BlastResult {
                                     label,
-                                    tx_hash,
-                                    error: None,
-                                };
+                                    tx_hash: None,
+                                    error: Some(error),
+                                }
                             }
-                            let error = json
-                                .get("error")
-                                .and_then(|v| v.get("message"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown RPC error")
-                                .to_owned();
-                            BlastResult {
+                            // A transport-level rejection (415, 429, 5xx) sends
+                            // a non-JSON body; surface the status rather than a
+                            // bare "expected value at line 1" decode error.
+                            Err(error) => BlastResult {
                                 label,
                                 tx_hash: None,
-                                error: Some(error),
-                            }
+                                error: Some(if status.is_success() {
+                                    error.to_string()
+                                } else {
+                                    format!("HTTP {status}")
+                                }),
+                            },
                         }
-                        Err(error) => BlastResult {
-                            label,
-                            tx_hash: None,
-                            error: Some(error.to_string()),
-                        },
-                    },
+                    }
                     Err(error) => BlastResult {
                         label,
                         tx_hash: None,
@@ -211,16 +246,6 @@ pub fn rejection_reasons(results: &[BlastResult]) -> Vec<&str> {
     reasons
 }
 
-async fn futures_join_all<F, T>(futures: impl IntoIterator<Item = F>)
-where
-    F: std::future::Future<Output = T>,
-{
-    let futures: Vec<_> = futures.into_iter().collect();
-    for future in futures {
-        future.await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +262,99 @@ mod tests {
             "nonce too low - transaction already known"
         ));
         assert!(!is_already_known("insufficient funds for gas"));
+    }
+
+    /// Accept one request on loopback, return the raw head, and reply with a
+    /// canned JSON-RPC result.
+    async fn capture_one_request(listener: tokio::net::TcpListener, reply: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buffer = vec![0u8; 8192];
+        let read = socket.read(&mut buffer).await.expect("read");
+        let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{reply}",
+            reply.len()
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+        let _ = socket.flush().await;
+        request
+    }
+
+    /// Geth and reth answer a JSON-RPC POST that lacks `Content-Type:
+    /// application/json` with HTTP 415, which would silently sink the entire
+    /// blast. The body is serialised ahead of fire time rather than via
+    /// `RequestBuilder::json`, so the header has to be set explicitly.
+    #[tokio::test]
+    async fn blast_sends_json_content_type() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url: Url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(capture_one_request(
+            listener,
+            r#"{"jsonrpc":"2.0","id":1,"result":"0x00"}"#,
+        ));
+
+        let prepared = PreparedBlast {
+            tx_hash: B256::ZERO,
+            body:
+                r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0xdead"],"id":1}"#
+                    .to_owned(),
+        };
+        let endpoints = parse_endpoints(&[url]);
+        for handle in blast_to_all(&build_client().unwrap(), &prepared, &endpoints) {
+            let _ = handle.await;
+        }
+
+        let request = server.await.expect("server task");
+        let lowered = request.to_ascii_lowercase();
+        assert!(
+            lowered.contains("content-type: application/json"),
+            "blast must declare a JSON content type, got:\n{request}"
+        );
+        assert!(request.contains("eth_sendRawTransaction"));
+    }
+
+    /// A rejection that is not JSON (a 415 or 429 error page) must report the
+    /// status rather than a bare serde decode error.
+    #[tokio::test]
+    async fn non_json_rejection_reports_http_status() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url: Url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buffer = vec![0u8; 8192];
+            let _ = socket.read(&mut buffer).await;
+            let body = "invalid content type, only application/json is supported";
+            let response = format!(
+                "HTTP/1.1 415 Unsupported Media Type\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+
+        let prepared = PreparedBlast {
+            tx_hash: B256::ZERO,
+            body: "{}".to_owned(),
+        };
+        let endpoints = parse_endpoints(&[url]);
+        let mut results = Vec::new();
+        for handle in blast_to_all(&build_client().unwrap(), &prepared, &endpoints) {
+            results.push(handle.await.unwrap());
+        }
+        let _ = server.await;
+
+        assert!(!is_accepted(&results));
+        assert_eq!(
+            rejection_reasons(&results),
+            vec!["HTTP 415 Unsupported Media Type"]
+        );
     }
 }
