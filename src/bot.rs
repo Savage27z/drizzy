@@ -34,7 +34,7 @@ use tokio::{
 };
 
 use crate::{
-    assistant, logging,
+    assistant, logging, manifest_crypto,
     multi_wallet::WalletManifest,
     snipe::{self, SnipeOptions},
     sweep, wallet_generator,
@@ -325,6 +325,8 @@ pub async fn run_bot() -> Result<(), BotError> {
         ))
     })?;
 
+    prepare_encryption_at_rest(&wallets_dir)?;
+
     let bot = Arc::new(Bot::new(token, allowed, wallets_dir)?);
 
     let me = bot.api("getMe", json!({})).await?;
@@ -589,6 +591,36 @@ async fn handle_natural_language(bot: &Arc<Bot>, chat_id: i64, text: &str) {
     show_confirm(bot, chat_id, &wizard).await;
 }
 
+/// Seal any manifests left plaintext by an earlier deployment. Done once at
+/// startup rather than lazily on read, so the conversion is bounded, visible in
+/// the logs, and never races a snipe. A failure here is fatal: continuing would
+/// silently leave keys in plaintext while the logs claimed otherwise.
+fn prepare_encryption_at_rest(wallets_dir: &Path) -> Result<(), BotError> {
+    if !manifest_crypto::is_enabled() {
+        logging::warn(format!(
+            "{} is not set — wallet manifests are stored in plaintext",
+            manifest_crypto::PASSPHRASE_ENV
+        ));
+        return Ok(());
+    }
+    match manifest_crypto::migrate_directory(wallets_dir) {
+        Ok(0) => {
+            logging::info("Wallet manifests are encrypted at rest.");
+            Ok(())
+        }
+        Ok(count) => {
+            logging::success(format!(
+                "Encrypted {count} plaintext wallet manifest(s) at rest."
+            ));
+            Ok(())
+        }
+        Err(error) => {
+            logging::error(format!("Cannot encrypt existing manifests: {error}"));
+            Err(BotError::Telegram(error.to_string()))
+        }
+    }
+}
+
 /// First run for a chat: offer to create wallets. Never offers to regenerate
 /// over an existing manifest — those wallets may hold funds, and the
 /// generator refuses to overwrite anyway.
@@ -822,6 +854,21 @@ async fn handle_document(bot: &Arc<Bot>, chat_id: i64, message: &Value) {
     if let Err(error) = bot.download_file(file_path, &destination).await {
         let _ = bot
             .send(chat_id, &format!("❌ Could not save file: {error}"))
+            .await;
+        return;
+    }
+    // The upload arrives as plaintext. Seal it immediately so an imported
+    // manifest is protected exactly like a generated one.
+    if manifest_crypto::is_enabled()
+        && let Ok(plaintext) = std::fs::read_to_string(&destination)
+        && !manifest_crypto::is_encrypted(&plaintext)
+        && let Err(error) = manifest_crypto::write_manifest(&destination, &plaintext)
+    {
+        let _ = bot
+            .send(
+                chat_id,
+                &format!("❌ Could not encrypt the import: {error}"),
+            )
             .await;
         return;
     }

@@ -20,6 +20,12 @@ pub enum WalletManifestError {
     NotRegularFile,
     #[error("wallet manifest exceeds the 1 MiB input limit")]
     TooLarge,
+    #[error(
+        "wallet manifest is encrypted but WALLETS_PASSPHRASE is not set — set it to the passphrase used when the wallets were created"
+    )]
+    PassphraseRequired,
+    #[error("{0}")]
+    Decrypt(String),
     #[error("wallet manifest cannot be read")]
     Read(#[source] std::io::Error),
     #[error("wallet manifest is not valid versioned JSON")]
@@ -72,6 +78,15 @@ impl WalletManifest {
             .map_err(WalletManifestError::Read)?;
         if source.len() as u64 > MAX_MANIFEST_BYTES {
             return Err(WalletManifestError::TooLarge);
+        }
+        // Manifests may be sealed at rest. Plaintext still loads unchanged, so
+        // an existing deployment keeps working after the upgrade.
+        if crate::manifest_crypto::is_encrypted(&source) {
+            let passphrase = crate::manifest_crypto::passphrase_from_env()
+                .ok_or(WalletManifestError::PassphraseRequired)?;
+            let opened = crate::manifest_crypto::decrypt(&source, &passphrase)
+                .map_err(|error| WalletManifestError::Decrypt(error.to_string()))?;
+            return Self::from_json(&opened);
         }
         Self::from_json(&source)
     }

@@ -36,6 +36,8 @@ pub enum WalletGeneratorError {
     Write(#[source] io::Error),
     #[error("generated wallet manifest could not be serialized")]
     Serialize(#[source] serde_json::Error),
+    #[error("generated wallet manifest could not be encrypted: {0}")]
+    Encrypt(String),
 }
 
 pub struct GeneratedWalletManifest {
@@ -99,12 +101,23 @@ pub fn create_wallet_manifest(
         version: MANIFEST_VERSION,
         wallets,
     };
-    let encoded = Zeroizing::new(
-        serde_json::to_vec_pretty(&manifest).map_err(WalletGeneratorError::Serialize)?,
+    let plaintext = Zeroizing::new(
+        serde_json::to_string_pretty(&manifest).map_err(WalletGeneratorError::Serialize)?,
     );
-    if encoded.len() > MAX_MANIFEST_BYTES {
+    // Seal at rest when a passphrase is configured. The size check applies to
+    // the plaintext: the ceiling exists to bound what we will parse back, and
+    // the envelope's hex expansion is not user-controlled.
+    if plaintext.len() > MAX_MANIFEST_BYTES {
         return Err(WalletGeneratorError::ManifestTooLarge);
     }
+    let encoded = Zeroizing::new(
+        match crate::manifest_crypto::passphrase_from_env() {
+            Some(passphrase) => crate::manifest_crypto::encrypt(&plaintext, &passphrase)
+                .map_err(|error| WalletGeneratorError::Encrypt(error.to_string()))?,
+            None => plaintext.to_string(),
+        }
+        .into_bytes(),
+    );
 
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);

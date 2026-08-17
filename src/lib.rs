@@ -11,6 +11,7 @@ pub mod executor_deployment;
 mod fee;
 pub mod funds;
 pub mod logging;
+pub mod manifest_crypto;
 pub mod multi_mint;
 pub mod multi_wallet;
 pub mod nft;

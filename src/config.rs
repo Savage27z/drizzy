@@ -48,6 +48,7 @@ const KNOWN_SETTINGS: &[&str] = &[
     "ANTHROPIC_MODEL",
     "WALLETS_DIR",
     "WITHDRAW_CHAIN",
+    "WALLETS_PASSPHRASE",
 ];
 const GWEI_IN_WEI: u64 = 1_000_000_000;
 

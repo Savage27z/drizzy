@@ -19,6 +19,13 @@ alloy-eip7702 = { version = "=0.6.3", features = ["k256"] }
 alloy-primitives = { version = "=1.6.1", default-features = false, features = ["k256", "rlp", "std"] }
 alloy-rlp = { version = "=0.3.16", features = ["derive"] }
 alloy-sol-types = "=1.6.1"
+# Manifest encryption at rest: Argon2id derives a key from the operator
+# passphrase, ChaCha20-Poly1305 seals the manifest. Both are pure-Rust
+# RustCrypto crates (no new C toolchain in the build image, unlike aws-lc-sys)
+# and constant-time in software, which matters on a container with no
+# guaranteed AES-NI.
+argon2 = { version = "=0.5.3", features = ["std", "zeroize"] }
+chacha20poly1305 = { version = "=0.11.0", features = ["getrandom", "zeroize"] }
 clap = { version = "=4.6.0", features = ["derive"] }
 crossterm = { version = "=0.29.0", default-features = false, features = ["windows"] }
 dotenvy = "=0.15.7"
