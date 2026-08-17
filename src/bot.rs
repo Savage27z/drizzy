@@ -482,13 +482,20 @@ async fn handle_natural_language(bot: &Arc<Bot>, chat_id: i64, text: &str) {
     wizard.chain.clone_from(&proposal.chain);
     wizard.quantity = proposal.quantity.unwrap_or(1);
     wizard.early_fire_ms = proposal.early_fire_ms.unwrap_or(0);
-    wizard.wallets = proposal
-        .wallet_count
-        .map(|count| (0..usize::try_from(count).unwrap_or(usize::MAX)).collect());
+    // A proposed count becomes the leading N manifest indices, clamped to what
+    // the manifest actually holds — an unclamped count would fail late with
+    // "wallet index N out of range" instead of staging what exists. Zero is
+    // meaningless and is treated as unset ("all") rather than as an empty
+    // selection, which would fail with "no wallets configured".
+    wizard.wallets = proposal.wallet_count.and_then(|count| {
+        let requested = usize::try_from(count).unwrap_or(usize::MAX);
+        let usable = requested.min(wallets_available);
+        (usable > 0).then(|| (0..usable).collect())
+    });
 
     // Without a chain there is nothing to preview against, so fall back to the
     // button rather than guessing one.
-    let Some(_) = wizard.chain.clone() else {
+    if wizard.chain.is_none() {
         wizard.step = Step::Chain;
         bot.wizards.lock().await.insert(chat_id, wizard);
         let _ = bot
@@ -503,7 +510,7 @@ async fn handle_natural_language(bot: &Arc<Bot>, chat_id: i64, text: &str) {
             )
             .await;
         return;
-    };
+    }
 
     wizard.step = Step::Confirm;
     bot.wizards.lock().await.insert(chat_id, wizard.clone());
@@ -1078,28 +1085,42 @@ fn split_message(text: &str) -> Vec<String> {
 
     let mut chunks = Vec::new();
     let mut current = String::new();
+    // Track lengths alongside the buffers: `chars().count()` walks the whole
+    // string, so recomputing it per character turns a long line into
+    // quadratic work.
+    let mut current_len = 0usize;
     for line in text.split_inclusive('\n') {
+        let line_len = line.chars().count();
+
         // A single oversized line cannot be placed whole; flush and hard-split.
-        if line.chars().count() > MAX_MESSAGE_CHARS {
+        if line_len > MAX_MESSAGE_CHARS {
             if !current.is_empty() {
                 chunks.push(std::mem::take(&mut current));
+                current_len = 0;
             }
             let mut piece = String::new();
+            let mut piece_len = 0usize;
             for character in line.chars() {
-                if piece.chars().count() == MAX_MESSAGE_CHARS {
+                if piece_len == MAX_MESSAGE_CHARS {
                     chunks.push(std::mem::take(&mut piece));
+                    piece_len = 0;
                 }
                 piece.push(character);
+                piece_len += 1;
             }
             if !piece.is_empty() {
                 current = piece;
+                current_len = piece_len;
             }
             continue;
         }
-        if current.chars().count() + line.chars().count() > MAX_MESSAGE_CHARS {
+
+        if current_len + line_len > MAX_MESSAGE_CHARS {
             chunks.push(std::mem::take(&mut current));
+            current_len = 0;
         }
         current.push_str(line);
+        current_len += line_len;
     }
     if !current.is_empty() {
         chunks.push(current);
@@ -1244,6 +1265,36 @@ mod tests {
                 "chunks must begin at a row boundary, got: {chunk:.20}"
             );
         }
+    }
+
+    /// An oversized line sitting between normal lines is the case most likely
+    /// to drop or duplicate content, since it flushes and resumes the buffer.
+    #[test]
+    fn oversized_line_between_normal_lines_preserves_everything() {
+        let text = format!(
+            "first line\n{}\nlast line\n",
+            "x".repeat(MAX_MESSAGE_CHARS * 2 + 17)
+        );
+        let chunks = split_message(&text);
+
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= MAX_MESSAGE_CHARS);
+        }
+        assert_eq!(
+            chunks.concat(),
+            text,
+            "no content may be lost or duplicated"
+        );
+        assert!(
+            chunks
+                .first()
+                .is_some_and(|chunk| chunk.starts_with("first line"))
+        );
+        assert!(
+            chunks
+                .last()
+                .is_some_and(|chunk| chunk.ends_with("last line\n"))
+        );
     }
 
     /// A single line longer than the cap has to be cut mid-line, and the cut

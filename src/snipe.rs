@@ -1017,7 +1017,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
             emit_info!(format!("[W{index}] first accept: {label} ({latency_ms}ms)"));
         }
     }
-    if accepted.len() > 1 {
+    if !accepted.is_empty() {
         let runs: Vec<&[BlastResult]> = accepted
             .iter()
             .map(|(_, _, results)| results.as_slice())

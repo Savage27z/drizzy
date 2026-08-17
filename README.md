@@ -539,6 +539,8 @@ The chain ID is read from `RPC_URL`; the user does not configure a separate chai
 | --- | ---: | --- |
 | `MAX_TOTAL_SPEND_WEI` | unset | Refuses to arm when `wallets × (mint value + max gas cost)` exceeds this many wei. A guardrail against a mistyped quantity or wallet count; unset disables the check |
 | `ANTHROPIC_API_KEY` | unset | Enables natural-language control in the Telegram bot. Plain-English messages become a **staged proposal** that still requires pressing FIRE — the model never mints, signs, or broadcasts. Unset disables the feature and leaves the wizard unchanged |
+| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Host root of an Anthropic-compatible gateway (no `/v1` suffix). Any gateway you point this at sees every message you send the bot — collection addresses and wallet counts. Wallet keys never leave the server regardless |
+| `ANTHROPIC_MODEL` | `claude-opus-5` | Model id override, for gateways that expose different ids than the first-party API |
 
 ### Multi-wallet settings
 
