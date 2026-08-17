@@ -46,6 +46,8 @@ const KNOWN_SETTINGS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
+    "WALLETS_DIR",
+    "WITHDRAW_CHAIN",
 ];
 const GWEI_IN_WEI: u64 = 1_000_000_000;
 

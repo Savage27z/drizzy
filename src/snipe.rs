@@ -97,6 +97,13 @@ fn resolve_chain(key: &str) -> Option<&'static ChainProfile> {
     CHAINS.iter().find(|profile| profile.key == key)
 }
 
+/// Chain id and public endpoints for a chain key, for callers outside the
+/// snipe path (the sweep path needs the same registry).
+#[must_use]
+pub fn public_rpcs_for(chain: &str) -> Option<(u64, &'static [&'static str])> {
+    resolve_chain(chain).map(|profile| (profile.chain_id, profile.public_rpcs))
+}
+
 fn chain_by_id(chain_id: u64) -> Option<&'static ChainProfile> {
     CHAINS.iter().find(|profile| profile.chain_id == chain_id)
 }

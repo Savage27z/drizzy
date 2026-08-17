@@ -4,14 +4,21 @@
 //! top of the existing `reqwest/serde_json/tokio` stack.
 //!
 //! Security model:
-//! - Owner-only: every chat id must be in `ALLOWED_CHAT_IDS`.
-//! - Private keys never appear in chat. Wallets come from the server-side
-//!   manifest (`WALLETS_FILE`, default `wallets.json`) or from a `wallets.json`
-//!   **file upload** (downloaded, validated, saved server-side).
+//! - Allowlisted: every chat id must be in `ALLOWED_CHAT_IDS`.
+//! - **Per-chat isolation.** Each allowed chat owns a separate manifest at
+//!   `WALLETS_DIR/<chat_id>.json`. Allowlisting is not a tenancy model on its
+//!   own: with one shared manifest, any allowed user could list, spend, or
+//!   overwrite every other user's wallets, so every wallet read, write,
+//!   preview, fire, and sweep is keyed by chat id.
+//! - Private keys never appear in chat. Wallets are generated server-side via
+//!   `/start`, or imported from a `wallets.json` upload — which is refused
+//!   when a manifest already exists, so an import cannot destroy funded keys.
+//! - `/withdraw` sweeps a chat's wallets to an address it nominates. A bot that
+//!   generates wallets must offer an exit, or funds are stranded.
 //! - The fire path runs in a background task; progress streams to the chat.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     path::{Path, PathBuf},
     sync::Arc,
@@ -30,6 +37,7 @@ use crate::{
     assistant, logging,
     multi_wallet::WalletManifest,
     snipe::{self, SnipeOptions},
+    sweep, wallet_generator,
 };
 
 #[allow(unused_imports)]
@@ -38,7 +46,12 @@ use std::fmt::Write as _;
 const API_BASE: &str = "https://api.telegram.org/bot";
 const POLL_TIMEOUT_SECONDS: u64 = 25;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(70);
-const DEFAULT_WALLETS_FILE: &str = "wallets.json";
+/// Relative to the image's `WORKDIR` (`/data`), so this lands on the mounted
+/// volume by default.
+const DEFAULT_WALLETS_DIR: &str = "wallets";
+/// Ceiling on wallets one chat may generate, so a shared bot cannot be used to
+/// fill the volume or stage an unbounded spend.
+const MAX_WALLETS_PER_USER: usize = 50;
 /// Roughly a minute of tolerance for a rolling redeploy's old container to
 /// finish draining before this instance declares the token contended.
 const CONFLICT_MAX_ATTEMPTS: u32 = 12;
@@ -109,13 +122,18 @@ struct Bot {
     http: reqwest::Client,
     token: String,
     allowed: Vec<i64>,
-    wallets_file: PathBuf,
+    /// Directory holding one manifest per chat. A single shared file would let
+    /// any allowed user spend, list, or overwrite everyone else's wallets.
+    wallets_dir: PathBuf,
     wizards: Mutex<HashMap<i64, Wizard>>,
     active: Mutex<HashMap<i64, usize>>,
+    /// Chats that have been asked how many wallets to generate and whose next
+    /// plain message is that count.
+    awaiting_wallet_count: Mutex<HashSet<i64>>,
 }
 
 impl Bot {
-    fn new(token: String, allowed: Vec<i64>, wallets_file: PathBuf) -> Result<Self, BotError> {
+    fn new(token: String, allowed: Vec<i64>, wallets_dir: PathBuf) -> Result<Self, BotError> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -124,10 +142,23 @@ impl Bot {
             http,
             token,
             allowed,
-            wallets_file,
+            wallets_dir,
             wizards: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
+            awaiting_wallet_count: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Manifest path for one chat. `chat_id` is an integer straight from
+    /// Telegram, so it cannot contain path separators or traverse out of the
+    /// directory — no sanitising is required, and none should be inferred as
+    /// safe for any caller-supplied string.
+    fn manifest_path(&self, chat_id: i64) -> PathBuf {
+        self.wallets_dir.join(format!("{chat_id}.json"))
+    }
+
+    fn has_manifest(&self, chat_id: i64) -> bool {
+        self.manifest_path(chat_id).is_file()
     }
 
     fn is_allowed(&self, chat_id: i64) -> bool {
@@ -240,9 +271,9 @@ impl Bot {
         })
     }
 
-    fn load_manifest(&self) -> Result<Vec<(usize, Address, u64)>, String> {
-        let manifest =
-            WalletManifest::load(&self.wallets_file).map_err(|error| error.to_string())?;
+    fn load_manifest(&self, chat_id: i64) -> Result<Vec<(usize, Address, u64)>, String> {
+        let manifest = WalletManifest::load(&self.manifest_path(chat_id))
+            .map_err(|error| error.to_string())?;
         Ok(manifest
             .wallets()
             .iter()
@@ -276,10 +307,25 @@ pub async fn run_bot() -> Result<(), BotError> {
     if allowed.is_empty() {
         return Err(BotError::NoAllowedChats);
     }
-    let wallets_file = env::var("WALLETS_FILE")
-        .map_or_else(|_| PathBuf::from(DEFAULT_WALLETS_FILE), PathBuf::from);
+    // Each chat gets its own manifest. WALLETS_FILE named a single shared file,
+    // which in a multi-user bot would let any allowed chat spend or overwrite
+    // everyone else's wallets — so it is deliberately not honoured here, and
+    // its presence is called out rather than silently ignored.
+    if env::var("WALLETS_FILE").is_ok() {
+        logging::warn(
+            "WALLETS_FILE is ignored by the bot — wallets are per-chat under WALLETS_DIR",
+        );
+    }
+    let wallets_dir =
+        env::var("WALLETS_DIR").map_or_else(|_| PathBuf::from(DEFAULT_WALLETS_DIR), PathBuf::from);
+    std::fs::create_dir_all(&wallets_dir).map_err(|error| {
+        BotError::Telegram(format!(
+            "cannot create wallets directory {}: {error}",
+            wallets_dir.display()
+        ))
+    })?;
 
-    let bot = Arc::new(Bot::new(token, allowed, wallets_file)?);
+    let bot = Arc::new(Bot::new(token, allowed, wallets_dir)?);
 
     let me = bot.api("getMe", json!({})).await?;
     let username = me.get("username").and_then(Value::as_str).unwrap_or("?");
@@ -288,7 +334,10 @@ pub async fn run_bot() -> Result<(), BotError> {
         "Telegram bot @{username} online — owner chat(s): {:?}",
         bot.allowed
     ));
-    logging::info(format!("Wallets manifest: {}", bot.wallets_file.display()));
+    logging::info(format!(
+        "Per-chat wallet manifests: {}",
+        bot.wallets_dir.display()
+    ));
     logging::info("Waiting for updates...");
     logging::section_break();
 
@@ -384,23 +433,34 @@ async fn handle_update(bot: &Arc<Bot>, update: Value) {
 
 const HELP: &str = "🦈 SeaDrop sniper bot\n\n\
 Commands:\n\
-/wallets — list manifest wallets (addresses only)\n\
+/start — create your wallets (first run)\n\
+/wallets — list your wallets (addresses only)\n\
 /snipe — start a snipe wizard (collection → chain → qty → wallets → gas → early fire)\n\
+/withdraw <address> — sweep all your wallets to an address\n\
 /cancel — abandon the current wizard\n\
 /status — active snipe count\n\
 /help — this message\n\n\
-📎 Import a manifest by uploading a wallets.json file — keys are saved server-side and never shown in chat.";
+💡 Paste an OpenSea link or a 0x contract address to stage a snipe directly.\n\n\
+🔒 Your wallets are yours alone — each chat has its own manifest. Keys are held \
+server-side and never shown in chat.";
 
 async fn handle_text(bot: &Arc<Bot>, chat_id: i64, text: &str) {
     let trimmed = text.trim();
     if let Some(command) = trimmed.strip_prefix('/') {
         let command = command.split_whitespace().next().unwrap_or_default();
         match command {
-            "start" | "help" => {
+            "start" => {
+                start_onboarding(bot, chat_id).await;
+            }
+            "help" => {
                 let _ = bot.send(chat_id, HELP).await;
             }
             "wallets" => {
                 let _ = list_wallets(bot, chat_id).await;
+            }
+            "withdraw" => {
+                let argument = trimmed.split_whitespace().nth(1).unwrap_or_default();
+                handle_withdraw(bot, chat_id, argument).await;
             }
             "snipe" => {
                 let mut wizards = bot.wizards.lock().await;
@@ -433,6 +493,13 @@ async fn handle_text(bot: &Arc<Bot>, chat_id: i64, text: &str) {
         return;
     }
 
+    // A pending wallet-count answer outranks everything else: the user was
+    // just asked a question and their reply is that answer, not a snipe.
+    if bot.awaiting_wallet_count.lock().await.contains(&chat_id) {
+        create_wallets_from_text(bot, chat_id, trimmed).await;
+        return;
+    }
+
     // With a wizard running, plain text is always an answer to the current
     // step — a link pasted mid-flow is the collection, not a new snipe.
     if bot.wizards.lock().await.contains_key(&chat_id) {
@@ -457,7 +524,9 @@ async fn handle_text(bot: &Arc<Bot>, chat_id: i64, text: &str) {
 /// proposal lands on the normal confirm screen — this changes how the wizard
 /// gets filled in, never whether a human approves the spend.
 async fn handle_natural_language(bot: &Arc<Bot>, chat_id: i64, text: &str) {
-    let wallets_available = bot.load_manifest().map_or(0, |wallets| wallets.len());
+    let wallets_available = bot
+        .load_manifest(chat_id)
+        .map_or(0, |wallets| wallets.len());
 
     let reply = match assistant::interpret(text, wallets_available).await {
         Ok(reply) => reply,
@@ -520,37 +589,181 @@ async fn handle_natural_language(bot: &Arc<Bot>, chat_id: i64, text: &str) {
     show_confirm(bot, chat_id, &wizard).await;
 }
 
+/// First run for a chat: offer to create wallets. Never offers to regenerate
+/// over an existing manifest — those wallets may hold funds, and the
+/// generator refuses to overwrite anyway.
+async fn start_onboarding(bot: &Arc<Bot>, chat_id: i64) {
+    if bot.has_manifest(chat_id) {
+        let _ = bot
+            .send(
+                chat_id,
+                "👋 You already have wallets. /wallets to list them, /snipe to mint, /withdraw to sweep them out.",
+            )
+            .await;
+        return;
+    }
+
+    bot.awaiting_wallet_count.lock().await.insert(chat_id);
+    let _ = bot
+        .send_keyboard(
+            chat_id,
+            &format!(
+                "👋 Welcome. Let's create your wallets.\n\n\
+                 They're generated on the server and belong to this chat only — nobody else can \
+                 see or spend them. You fund them, and /withdraw sweeps them back out whenever \
+                 you want.\n\n\
+                 How many? (1–{MAX_WALLETS_PER_USER}, or send a number)"
+            ),
+            &[&[("3", "wallets:3"), ("5", "wallets:5"), ("10", "wallets:10")]],
+        )
+        .await;
+}
+
+/// Parse a typed wallet count and create the manifest.
+async fn create_wallets_from_text(bot: &Arc<Bot>, chat_id: i64, text: &str) {
+    match text.trim().parse::<usize>() {
+        Ok(count) => create_wallets(bot, chat_id, count).await,
+        Err(_) => {
+            let _ = bot
+                .send(
+                    chat_id,
+                    &format!("Send a number between 1 and {MAX_WALLETS_PER_USER}, or /cancel."),
+                )
+                .await;
+        }
+    }
+}
+
+async fn create_wallets(bot: &Arc<Bot>, chat_id: i64, count: usize) {
+    if count == 0 || count > MAX_WALLETS_PER_USER {
+        let _ = bot
+            .send(
+                chat_id,
+                &format!("Pick a number between 1 and {MAX_WALLETS_PER_USER}."),
+            )
+            .await;
+        return;
+    }
+
+    // Clear the pending question before doing the work, so a failure does not
+    // leave the chat stuck answering a question it can no longer complete.
+    bot.awaiting_wallet_count.lock().await.remove(&chat_id);
+
+    let path = bot.manifest_path(chat_id);
+    match wallet_generator::create_wallet_manifest(&path, count, 1) {
+        Ok(manifest) => {
+            let mut lines = format!("✅ Created {count} wallet(s). Fund these addresses:\n\n");
+            for (index, address) in manifest.addresses().iter().enumerate() {
+                let _ = writeln!(lines, "  {index}: `{address}`");
+            }
+            lines.push_str(
+                "\nSend each one the mint price plus a little gas — no more than you're willing \
+                 to lose on a drop.\n\nThen /snipe, or paste an OpenSea link.",
+            );
+            let _ = bot.send(chat_id, &lines).await;
+        }
+        Err(error) => {
+            let _ = bot
+                .send(chat_id, &format!("❌ Could not create wallets: {error}"))
+                .await;
+        }
+    }
+}
+
+/// Sweep every wallet in the caller's manifest to a nominated address.
+async fn handle_withdraw(bot: &Arc<Bot>, chat_id: i64, argument: &str) {
+    if !bot.has_manifest(chat_id) {
+        let _ = bot
+            .send(chat_id, "You have no wallets yet — /start to create some.")
+            .await;
+        return;
+    }
+    if argument.is_empty() {
+        let _ = bot
+            .send(
+                chat_id,
+                "Send the destination: `/withdraw 0xYourAddress`\n\nEvery wallet is swept to that address.",
+            )
+            .await;
+        return;
+    }
+    let destination = match sweep::parse_destination(argument) {
+        Ok(destination) => destination,
+        Err(error) => {
+            let _ = bot.send(chat_id, &format!("❌ {error}")).await;
+            return;
+        }
+    };
+
+    // Sweeping needs a chain, and there is no wizard context here. Default to
+    // the chain the bot is most used on and let the user override explicitly.
+    let chain = env::var("WITHDRAW_CHAIN").unwrap_or_else(|_| "base".to_owned());
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let options = sweep::SweepOptions {
+        wallets_file: bot.manifest_path(chat_id),
+        destination,
+        chain: chain.clone(),
+        rpc_urls: env_rpc_urls(),
+        notify: Some(tx),
+    };
+
+    let _ = bot
+        .send(
+            chat_id,
+            &format!("🧹 Sweeping every wallet to {destination} on {chain}..."),
+        )
+        .await;
+
+    let forwarder_bot = bot.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            let _ = forwarder_bot.send(chat_id, &line).await;
+        }
+    });
+
+    let result_bot = bot.clone();
+    tokio::spawn(async move {
+        let summary = match sweep::sweep(options).await {
+            Ok(report) => format!(
+                "🧹 Swept {} of {} wallet(s), {} wei total.",
+                report.swept_count(),
+                report.outcomes.len(),
+                report.total_sent()
+            ),
+            Err(error) => format!("❌ Sweep failed: {error}"),
+        };
+        let _ = forwarder.await;
+        let _ = result_bot.send(chat_id, &summary).await;
+    });
+}
+
+/// List only the caller's own wallets. Paths are never shown — they encode
+/// other users' chat ids, and a user has no use for a server-side path.
 async fn list_wallets(bot: &Arc<Bot>, chat_id: i64) -> Result<(), BotError> {
-    match bot.load_manifest() {
+    match bot.load_manifest(chat_id) {
         Ok(wallets) if wallets.is_empty() => {
             bot.send(
                 chat_id,
-                &format!(
-                    "⚠️ {} exists but has no wallets.\n\nGenerate with `opensea-mint wallets create` on the server, or upload a wallets.json here.",
-                    bot.wallets_file.display()
-                ),
+                "⚠️ Your manifest exists but holds no wallets. Send /start to create some.",
             )
             .await
         }
         Ok(wallets) => {
-            let mut lines = format!(
-                "🗂 {} — {} wallet(s):\n",
-                bot.wallets_file.display(),
-                wallets.len()
-            );
+            let mut lines = format!("🗂 Your wallets — {}:\n", wallets.len());
             for (index, address, quantity) in wallets {
                 let _ = writeln!(lines, "  {index}: `{address}` (qty {quantity})");
             }
+            let _ = writeln!(
+                lines,
+                "\nFund these, then /snipe. /withdraw to sweep them out."
+            );
             bot.send(chat_id, &lines).await
         }
         Err(_) => {
             bot.send(
                 chat_id,
-                &format!(
-                    "⚠️ No manifest at {}.\n\nGenerate one on the server (`opensea-mint wallets create --count N --output {}`) or upload a wallets.json file here.",
-                    bot.wallets_file.display(),
-                    bot.wallets_file.display()
-                ),
+                "⚠️ You have no wallets yet.\n\nSend /start to create some.",
             )
             .await
         }
@@ -593,25 +806,33 @@ async fn handle_document(bot: &Arc<Bot>, chat_id: i64, message: &Value) {
             .await;
         return;
     };
-    let destination = bot.wallets_file.clone();
+    // Import into the caller's own manifest, and never over funded wallets —
+    // an upload used to overwrite one shared file, so any user could destroy
+    // everyone else's keys with a single message and no confirmation.
+    let destination = bot.manifest_path(chat_id);
+    if destination.exists() {
+        let _ = bot
+            .send(
+                chat_id,
+                "⚠️ You already have wallets. Importing would overwrite them and any funds they hold.\n\nSweep them out with /withdraw first, then re-import.",
+            )
+            .await;
+        return;
+    }
     if let Err(error) = bot.download_file(file_path, &destination).await {
         let _ = bot
             .send(chat_id, &format!("❌ Could not save file: {error}"))
             .await;
         return;
     }
-    match bot.load_manifest() {
+    match bot.load_manifest(chat_id) {
         Ok(wallets) if wallets.is_empty() => {
             let _ = bot
                 .send(chat_id, "⚠️ The file parsed but contains no wallets.")
                 .await;
         }
         Ok(wallets) => {
-            let mut lines = format!(
-                "✅ Imported {} wallet(s) to {}:\n",
-                wallets.len(),
-                bot.wallets_file.display()
-            );
+            let mut lines = format!("✅ Imported {} wallet(s):\n", wallets.len());
             for (index, address, quantity) in wallets {
                 let _ = writeln!(lines, "  {index}: `{address}` (qty {quantity})");
             }
@@ -638,6 +859,12 @@ async fn handle_callback(bot: &Arc<Bot>, chat_id: i64, data: &str) {
         let _ = bot
             .send(chat_id, "Quantity per wallet? Send a number (default 1).")
             .await;
+        return;
+    }
+    if let Some(count) = data.strip_prefix("wallets:") {
+        if let Ok(count) = count.parse::<usize>() {
+            create_wallets(bot, chat_id, count).await;
+        }
         return;
     }
     match data {
@@ -928,7 +1155,7 @@ async fn show_confirm(bot: &Arc<Bot>, chat_id: i64, wizard: &Wizard) {
         collection: wizard.collection.clone(),
         quantity: Some(wizard.quantity),
         keys: Vec::new(),
-        wallets_file: Some(bot.wallets_file.clone()),
+        wallets_file: Some(bot.manifest_path(chat_id)),
         wallet_indices: wizard.wallets.clone(),
         rpc_urls: env_rpc_urls(),
         chain: Some(chain.clone()),
@@ -1020,7 +1247,7 @@ async fn fire_snipe(bot: &Arc<Bot>, chat_id: i64, wizard: Wizard) {
         collection: wizard.collection.clone(),
         quantity: Some(wizard.quantity),
         keys: Vec::new(),
-        wallets_file: Some(bot.wallets_file.clone()),
+        wallets_file: Some(bot.manifest_path(chat_id)),
         wallet_indices: wizard.wallets.clone(),
         rpc_urls: env_rpc_urls(),
         chain: Some(chain),
@@ -1188,6 +1415,36 @@ mod tests {
             (None, Some(U256::from(10_000_000u128)))
         );
         assert!(parse_gas("nope").is_err());
+    }
+
+    /// The core multi-tenant invariant: two chats must never resolve to the
+    /// same manifest, or one user can spend another's wallets.
+    #[test]
+    fn each_chat_gets_a_distinct_manifest_path() {
+        let bot = Bot::new(
+            "token".to_owned(),
+            vec![1, 2],
+            PathBuf::from("/data/wallets"),
+        )
+        .expect("client builds");
+
+        let first = bot.manifest_path(111);
+        let second = bot.manifest_path(222);
+
+        assert_ne!(first, second);
+        assert_eq!(first, PathBuf::from("/data/wallets/111.json"));
+        // Telegram group ids are negative; they must stay inside the directory.
+        assert_eq!(
+            bot.manifest_path(-100_123),
+            PathBuf::from("/data/wallets/-100123.json")
+        );
+        for chat_id in [111, 222, -100_123] {
+            assert_eq!(
+                bot.manifest_path(chat_id).parent(),
+                Some(Path::new("/data/wallets")),
+                "a manifest must never escape the wallets directory"
+            );
+        }
     }
 
     #[test]

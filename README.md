@@ -541,6 +541,8 @@ The chain ID is read from `RPC_URL`; the user does not configure a separate chai
 | `ANTHROPIC_API_KEY` | unset | Enables natural-language control in the Telegram bot. Plain-English messages become a **staged proposal** that still requires pressing FIRE — the model never mints, signs, or broadcasts. Unset disables the feature and leaves the wizard unchanged |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Host root of an Anthropic-compatible gateway (no `/v1` suffix). Any gateway you point this at sees every message you send the bot — collection addresses and wallet counts. Wallet keys never leave the server regardless |
 | `ANTHROPIC_MODEL` | `claude-opus-5` | Model id override, for gateways that expose different ids than the first-party API |
+| `WALLETS_DIR` | `wallets` | Directory of **per-chat** manifests (`<chat_id>.json`). Each allowed chat owns its own wallets — allowlisting alone is not isolation. Relative paths resolve under the image `WORKDIR` (`/data`), so the default lands on the mounted volume. `WALLETS_FILE` is ignored by the bot |
+| `WITHDRAW_CHAIN` | `base` | Chain used by `/withdraw` when sweeping a chat's wallets to a nominated address |
 
 ### Multi-wallet settings
 
