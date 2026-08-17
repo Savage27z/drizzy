@@ -312,6 +312,7 @@ pub async fn execute(cli: Cli) -> Result<(), CommandError> {
                 gas_limit,
                 early_fire_ms,
                 fire_now,
+                max_total_spend_wei: snipe::default_spend_cap(),
                 notify: None,
             })
             .await

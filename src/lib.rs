@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod assistant;
 pub mod blast;
 pub mod bot;
 pub mod chain;

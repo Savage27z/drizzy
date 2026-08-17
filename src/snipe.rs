@@ -11,12 +11,13 @@
 //! Allowlist/FCFS stages (`mintSigned`) still need `OpenSea`'s per-wallet
 //! signatures, so those go through the existing `mint` command.
 
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, U256};
 use reqwest::StatusCode;
 use thiserror::Error;
 use tokio::{
+    sync::Semaphore,
     task::JoinHandle,
     time::{Instant, sleep},
 };
@@ -36,6 +37,9 @@ use crate::{
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap on simultaneous balance/nonce reads while arming. High enough that a
+/// large manifest arms quickly, low enough to stay under provider rate limits.
+const MAX_CONCURRENT_ACCOUNT_READS: usize = 8;
 const RECEIPT_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_GAS_LIMIT: u64 = 250_000;
 const GWEI: u128 = 1_000_000_000;
@@ -135,6 +139,18 @@ pub enum SnipeError {
     },
     #[error("invalid gas value: {0}")]
     InvalidGas(String),
+    #[error(
+        "total spend {total} wei across {wallets} wallet(s) exceeds the {cap} wei cap (MAX_TOTAL_SPEND_WEI); raise the cap or reduce wallets/quantity"
+    )]
+    SpendCapExceeded {
+        total: U256,
+        cap: U256,
+        wallets: usize,
+    },
+    #[error(
+        "mint simulation reverted for {address} while the stage is live — the mint would fail on-chain, so nothing was signed"
+    )]
+    SimulationReverted { address: Address },
     #[error("chain id mismatch: RPCs disagree ({first} vs {second})")]
     ChainMismatch { first: u64, second: u64 },
     #[error(transparent)]
@@ -166,6 +182,10 @@ pub struct SnipeOptions {
     pub gas_limit: u64,
     pub early_fire_ms: u64,
     pub fire_now: bool,
+    /// Hard ceiling on `wallets × (mint value + max gas cost)`. Refuses to arm
+    /// above it, so a mistyped quantity or wallet count cannot spend the whole
+    /// manifest. `None` disables the check.
+    pub max_total_spend_wei: Option<U256>,
     /// Optional channel receiving every progress line (bot streaming).
     pub notify: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
@@ -185,9 +205,20 @@ impl Default for SnipeOptions {
             gas_limit: DEFAULT_GAS_LIMIT,
             early_fire_ms: 0,
             fire_now: false,
+            max_total_spend_wei: default_spend_cap(),
             notify: None,
         }
     }
+}
+
+/// Read the spend cap from `MAX_TOTAL_SPEND_WEI`. An unset or unparseable
+/// value disables the check rather than blocking a snipe — the cap is a
+/// guardrail against fat-fingering, not a required setting.
+#[must_use]
+pub fn default_spend_cap() -> Option<U256> {
+    std::env::var("MAX_TOTAL_SPEND_WEI")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<U256>().ok())
 }
 
 /// Parse a decimal gwei string (e.g. `0.05` or `200`) into wei.
@@ -817,15 +848,26 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
     emit_info!("Checking balances and signing...");
     // Balance/nonce reads are independent per wallet, so fan them out — this
     // used to be one serial round trip per wallet, which is what made a large
-    // manifest slow to arm. Results are awaited in wallet order so the first
-    // failing wallet is still the one reported.
+    // manifest slow to arm. Bounded by a semaphore: a 50-wallet manifest firing
+    // 50 simultaneous batched reads gets rate-limited by most providers, which
+    // is slower than a capped fan-out and can fail the arm outright. Results
+    // are awaited in wallet order so the first failing wallet is still the one
+    // reported.
+    let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_ACCOUNT_READS));
     let state_handles: Vec<JoinHandle<Result<AccountState, ChainError>>> = plans
         .iter()
         .map(|(signer, _, _)| {
             let gateway = gateway.clone();
             let config = config.clone();
+            let permits = Arc::clone(&permits);
             let address = signer.identity().address;
-            tokio::spawn(async move { gateway.account_state(&config, 1, address).await })
+            tokio::spawn(async move {
+                let _permit = permits
+                    .acquire()
+                    .await
+                    .map_err(|_| ChainError::WalletSnapshotChanged)?;
+                gateway.account_state(&config, 1, address).await
+            })
         })
         .collect();
 
@@ -838,6 +880,35 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
         );
     }
 
+    // ── Simulation ──
+    // eth_estimateGas executes the call, so a revert here means the mint would
+    // fail on-chain. Before the stage opens SeaDrop reverts by design, so a
+    // revert is only decisive once the stage is live — arming early and
+    // treating that expected revert as fatal would break every scheduled snipe.
+    let stage_is_live = {
+        let now = unix_millis().max(0);
+        let stage_open = i64::try_from(drop.start_time)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000);
+        now >= stage_open
+    };
+    if let Some((signer, _, plan)) = plans.first() {
+        let sender = signer.identity().address;
+        let simulation = gateway
+            .estimate_transaction(&config, 1, sender, plan.to, plan.value, &plan.data)
+            .await;
+        match simulation {
+            Ok(gas) => emit_info!(format!("Simulation OK — mint would use ~{gas} gas")),
+            Err(_) if !stage_is_live => {
+                emit_info!(
+                    "Simulation reverted, as expected before the stage opens — continuing to arm"
+                );
+            }
+            Err(_) => return Err(SnipeError::SimulationReverted { address: sender }),
+        }
+    }
+
+    let mut total_spend = U256::ZERO;
     let mut prepared: Vec<PreparedWallet> = Vec::new();
     for ((index, (signer, _quantity, plan)), account) in plans.iter().enumerate().zip(accounts) {
         let required = plan
@@ -848,6 +919,18 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
                     .ok_or_else(|| SnipeError::InvalidGas("gas cost overflow".to_owned()))?,
             )
             .ok_or_else(|| SnipeError::InvalidGas("total cost overflow".to_owned()))?;
+        total_spend = total_spend
+            .checked_add(required)
+            .ok_or_else(|| SnipeError::InvalidGas("total spend overflow".to_owned()))?;
+        if let Some(cap) = options.max_total_spend_wei
+            && total_spend > cap
+        {
+            return Err(SnipeError::SpendCapExceeded {
+                total: total_spend,
+                cap,
+                wallets: plans.len(),
+            });
+        }
         if account.balance < required {
             let affordable = account.balance.saturating_sub(plan.value) / U256::from(gas_limit);
             return Err(SnipeError::Underfunded {
@@ -924,6 +1007,32 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
     ));
 
     let (accepted, rejected) = collect_results(fired).await;
+
+    // ── Endpoint telemetry ──
+    // Which RPC actually won the race, and how each performed across the run.
+    // Physical proximity to the endpoint dominates the latency budget, so this
+    // is the measurement that should drive endpoint (and region) choice.
+    for (index, _address, results) in &accepted {
+        if let Some((label, latency_ms)) = blast::winning_endpoint(results) {
+            emit_info!(format!("[W{index}] first accept: {label} ({latency_ms}ms)"));
+        }
+    }
+    if accepted.len() > 1 {
+        let runs: Vec<&[BlastResult]> = accepted
+            .iter()
+            .map(|(_, _, results)| results.as_slice())
+            .collect();
+        emit_info!("Endpoint scoreboard (fastest first):");
+        for stats in blast::endpoint_scoreboard(&runs) {
+            emit_info!(format!(
+                "    {} — {}/{} accepted, {}ms mean",
+                stats.label,
+                stats.accepted,
+                stats.attempts,
+                stats.mean_latency_ms()
+            ));
+        }
+    }
 
     for (index, address, results) in &rejected {
         let reasons = blast::rejection_reasons(results);

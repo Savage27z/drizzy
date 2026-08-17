@@ -533,6 +533,13 @@ The chain ID is read from `RPC_URL`; the user does not configure a separate chai
 | `OPENSEA_RETRY_INTERVAL_MS` | `250` | Fixed delay between retryable OpenSea requests, including calldata; range `50-30000` ms |
 | `OPENSEA_CALLDATA_MAX_ATTEMPTS` | `40` | Maximum T-2 calldata requests for not-ready, transient, malformed, or locally inconsistent actions; range `1-1000` |
 
+### Safety and assistant settings
+
+| Setting | Default | Purpose |
+| --- | ---: | --- |
+| `MAX_TOTAL_SPEND_WEI` | unset | Refuses to arm when `wallets × (mint value + max gas cost)` exceeds this many wei. A guardrail against a mistyped quantity or wallet count; unset disables the check |
+| `ANTHROPIC_API_KEY` | unset | Enables natural-language control in the Telegram bot. Plain-English messages become a **staged proposal** that still requires pressing FIRE — the model never mints, signs, or broadcasts. Unset disables the feature and leaves the wizard unchanged |
+
 ### Multi-wallet settings
 
 | Setting | Mode | Purpose |

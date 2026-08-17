@@ -68,7 +68,7 @@ impl ChainGateway {
         let client = Client::builder()
             .timeout(timeout)
             .pool_idle_timeout(None)
-            .pool_max_idle_per_host(2)
+            .pool_max_idle_per_host(crate::blast::POOL_MAX_IDLE_PER_HOST)
             .tcp_keepalive(Duration::from_mins(1))
             .http2_adaptive_window(true)
             .redirect(reqwest::redirect::Policy::none())

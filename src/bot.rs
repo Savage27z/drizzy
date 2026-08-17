@@ -27,7 +27,7 @@ use tokio::{
 };
 
 use crate::{
-    logging,
+    assistant, logging,
     multi_wallet::WalletManifest,
     snipe::{self, SnipeOptions},
 };
@@ -165,16 +165,21 @@ impl Bot {
         Ok(value.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    /// Telegram rejects any message over 4096 characters, so a 50-wallet
+    /// listing would be dropped rather than truncated. Split on line
+    /// boundaries where possible and send the pieces in order.
     async fn send(&self, chat_id: i64, text: &str) -> Result<(), BotError> {
-        self.api(
-            "sendMessage",
-            json!({
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": true,
-            }),
-        )
-        .await?;
+        for chunk in split_message(text) {
+            self.api(
+                "sendMessage",
+                json!({
+                    "chat_id": chat_id,
+                    "text": chunk,
+                    "disable_web_page_preview": true,
+                }),
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -427,7 +432,85 @@ async fn handle_text(bot: &Arc<Bot>, chat_id: i64, text: &str) {
         }
         return;
     }
+
+    // With a wizard running, plain text is always an answer to the current
+    // step — a link pasted mid-flow is the collection, not a new snipe.
+    if bot.wizards.lock().await.contains_key(&chat_id) {
+        advance_wizard(bot, chat_id, trimmed).await;
+        return;
+    }
+
+    if looks_like_collection(trimmed) {
+        start_from_locator(bot, chat_id, trimmed).await;
+        return;
+    }
+
+    if assistant::is_enabled() {
+        handle_natural_language(bot, chat_id, trimmed).await;
+        return;
+    }
+
     advance_wizard(bot, chat_id, trimmed).await;
+}
+
+/// Route free text through the model and stage whatever it proposes. The
+/// proposal lands on the normal confirm screen — this changes how the wizard
+/// gets filled in, never whether a human approves the spend.
+async fn handle_natural_language(bot: &Arc<Bot>, chat_id: i64, text: &str) {
+    let wallets_available = bot.load_manifest().map_or(0, |wallets| wallets.len());
+
+    let reply = match assistant::interpret(text, wallets_available).await {
+        Ok(reply) => reply,
+        Err(error) => {
+            let _ = bot.send(chat_id, &format!("❌ {error}")).await;
+            return;
+        }
+    };
+
+    let proposal = match reply {
+        assistant::Reply::Text(message) => {
+            let _ = bot.send(chat_id, &message).await;
+            return;
+        }
+        assistant::Reply::Propose(proposal) => proposal,
+    };
+
+    // Map the proposal onto a wizard. A wallet count becomes the leading N
+    // manifest indices; unset stays "all", which the confirm screen spells out.
+    let mut wizard = Wizard::new();
+    wizard.collection.clone_from(&proposal.collection);
+    wizard.chain.clone_from(&proposal.chain);
+    wizard.quantity = proposal.quantity.unwrap_or(1);
+    wizard.early_fire_ms = proposal.early_fire_ms.unwrap_or(0);
+    wizard.wallets = proposal
+        .wallet_count
+        .map(|count| (0..usize::try_from(count).unwrap_or(usize::MAX)).collect());
+
+    // Without a chain there is nothing to preview against, so fall back to the
+    // button rather than guessing one.
+    let Some(_) = wizard.chain.clone() else {
+        wizard.step = Step::Chain;
+        bot.wizards.lock().await.insert(chat_id, wizard);
+        let _ = bot
+            .send_keyboard(
+                chat_id,
+                &format!("🤖 {}\n\nWhich chain?", proposal.interpretation),
+                &[&[
+                    ("Base", "chain:base"),
+                    ("Ethereum", "chain:ethereum"),
+                    ("Robinhood", "chain:robinhood"),
+                ]],
+            )
+            .await;
+        return;
+    };
+
+    wizard.step = Step::Confirm;
+    bot.wizards.lock().await.insert(chat_id, wizard.clone());
+    let _ = bot
+        .send(chat_id, &format!("🤖 {}", proposal.interpretation))
+        .await;
+    show_confirm(bot, chat_id, &wizard).await;
 }
 
 async fn list_wallets(bot: &Arc<Bot>, chat_id: i64) -> Result<(), BotError> {
@@ -551,9 +634,19 @@ async fn handle_callback(bot: &Arc<Bot>, chat_id: i64, data: &str) {
         return;
     }
     match data {
+        // Take the wizard out and hand it to the fire path. Removing it first
+        // and having `fire_snipe` look it up again means the lookup always
+        // misses — pressing FIRE silently does nothing.
         "fire:yes" => {
-            bot.wizards.lock().await.remove(&chat_id);
-            fire_snipe(bot, chat_id).await;
+            let wizard = bot.wizards.lock().await.remove(&chat_id);
+            match wizard {
+                Some(wizard) => fire_snipe(bot, chat_id, wizard).await,
+                None => {
+                    let _ = bot
+                        .send(chat_id, "No snipe staged — send /snipe or paste a link.")
+                        .await;
+                }
+            }
         }
         "fire:no" => {
             bot.wizards.lock().await.remove(&chat_id);
@@ -689,6 +782,82 @@ async fn advance_wizard(bot: &Arc<Bot>, chat_id: i64, text: &str) {
     }
 }
 
+/// Does this message look like a collection locator rather than chatter? The
+/// snipe path already accepts an address, an `OpenSea` URL, or a slug, so this
+/// only has to recognise the first two — a bare word is far more likely to be
+/// conversation than a slug, and guessing wrong would hijack the message.
+fn looks_like_collection(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.len() == 42
+        && let Some(body) = trimmed.strip_prefix("0x")
+    {
+        return body.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    (lowered.starts_with("https://") || lowered.starts_with("http://"))
+        && lowered.contains("opensea.io")
+        && !trimmed.contains(char::is_whitespace)
+}
+
+/// `OpenSea` item and asset URLs carry the chain as a path segment
+/// (`/assets/base/0x…`, `/item/ethereum/0x…`). Lifting it saves the user a
+/// button press; collection-slug URLs carry no chain, so those still ask.
+fn infer_chain_from_url(text: &str) -> Option<String> {
+    let lowered = text.trim().to_ascii_lowercase();
+    let segments: Vec<&str> = lowered
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let marker = segments
+        .iter()
+        .position(|segment| *segment == "assets" || *segment == "item")?;
+    let candidate = segments.get(marker + 1)?;
+    match *candidate {
+        "ethereum" | "eth" | "mainnet" => Some("ethereum".to_owned()),
+        "base" => Some("base".to_owned()),
+        "robinhood" => Some("robinhood".to_owned()),
+        _ => None,
+    }
+}
+
+/// Entry point for a pasted link or address with no wizard running: stage the
+/// collection, lift the chain from the URL when it is there, and hand straight
+/// off to the quantity step so the flow is paste → confirm rather than
+/// `/snipe` → paste → confirm.
+async fn start_from_locator(bot: &Arc<Bot>, chat_id: i64, locator: &str) {
+    let mut wizard = Wizard::new();
+    wizard.collection = locator.trim().to_owned();
+
+    if let Some(chain) = infer_chain_from_url(locator) {
+        wizard.chain = Some(chain.clone());
+        wizard.step = Step::Quantity;
+        bot.wizards.lock().await.insert(chat_id, wizard);
+        let _ = bot
+            .send(
+                chat_id,
+                &format!(
+                    "🎯 Staged `{}` on {chain}.\n\nQuantity per wallet? Send a number (default 1).\n\n/cancel to abort.",
+                    locator.trim()
+                ),
+            )
+            .await;
+    } else {
+        wizard.step = Step::Chain;
+        bot.wizards.lock().await.insert(chat_id, wizard);
+        let _ = bot
+            .send_keyboard(
+                chat_id,
+                &format!("🎯 Staged `{}`.\n\nWhich chain?", locator.trim()),
+                &[&[
+                    ("Base", "chain:base"),
+                    ("Ethereum", "chain:ethereum"),
+                    ("Robinhood", "chain:robinhood"),
+                ]],
+            )
+            .await;
+    }
+}
+
 fn parse_wallet_selection(text: &str) -> Result<Vec<usize>, String> {
     let trimmed = text.trim().to_ascii_lowercase();
     if trimmed == "all" {
@@ -761,6 +930,7 @@ async fn show_confirm(bot: &Arc<Bot>, chat_id: i64, wizard: &Wizard) {
         gas_limit: 250_000,
         early_fire_ms: wizard.early_fire_ms,
         fire_now: false,
+        max_total_spend_wei: snipe::default_spend_cap(),
         notify: None,
     };
 
@@ -830,11 +1000,11 @@ async fn show_confirm(bot: &Arc<Bot>, chat_id: i64, wizard: &Wizard) {
     }
 }
 
-async fn fire_snipe(bot: &Arc<Bot>, chat_id: i64) {
-    let Some(wizard) = bot.wizards.lock().await.get(&chat_id).cloned() else {
-        return;
-    };
+async fn fire_snipe(bot: &Arc<Bot>, chat_id: i64, wizard: Wizard) {
     let Some(chain) = wizard.chain.clone() else {
+        let _ = bot
+            .send(chat_id, "No chain selected — send /snipe to start again.")
+            .await;
         return;
     };
 
@@ -852,6 +1022,7 @@ async fn fire_snipe(bot: &Arc<Bot>, chat_id: i64) {
         gas_limit: 250_000,
         early_fire_ms: wizard.early_fire_ms,
         fire_now: false,
+        max_total_spend_wei: snipe::default_spend_cap(),
         notify: Some(tx),
     };
 
@@ -890,6 +1061,50 @@ async fn fire_snipe(bot: &Arc<Bot>, chat_id: i64) {
         }
         let _ = forwarder.await;
     });
+}
+
+/// Telegram's hard cap is 4096 characters per message; it counts UTF-16 code
+/// units, so an emoji-heavy line costs more than its `char` count suggests.
+/// Split well under the limit rather than compute the exact encoding width.
+const MAX_MESSAGE_CHARS: usize = 3500;
+
+/// Break `text` into message-sized pieces, preferring line boundaries so a
+/// wallet listing never splits mid-row. A single line longer than the limit is
+/// cut on a character boundary — never mid-UTF-8-sequence.
+fn split_message(text: &str) -> Vec<String> {
+    if text.chars().count() <= MAX_MESSAGE_CHARS {
+        return vec![text.to_owned()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for line in text.split_inclusive('\n') {
+        // A single oversized line cannot be placed whole; flush and hard-split.
+        if line.chars().count() > MAX_MESSAGE_CHARS {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            let mut piece = String::new();
+            for character in line.chars() {
+                if piece.chars().count() == MAX_MESSAGE_CHARS {
+                    chunks.push(std::mem::take(&mut piece));
+                }
+                piece.push(character);
+            }
+            if !piece.is_empty() {
+                current = piece;
+            }
+            continue;
+        }
+        if current.chars().count() + line.chars().count() > MAX_MESSAGE_CHARS {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push_str(line);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn env_rpc_urls() -> Vec<String> {
@@ -952,5 +1167,96 @@ mod tests {
             (None, Some(U256::from(10_000_000u128)))
         );
         assert!(parse_gas("nope").is_err());
+    }
+
+    #[test]
+    fn locator_detection_accepts_addresses_and_opensea_urls() {
+        assert!(looks_like_collection(
+            "0x1234567890abcdef1234567890abcdef12345678"
+        ));
+        assert!(looks_like_collection(
+            "https://opensea.io/collection/some-drop"
+        ));
+        assert!(looks_like_collection(
+            "https://opensea.io/item/base/0xabc/1"
+        ));
+    }
+
+    /// Ordinary chat must never be mistaken for a collection — a false
+    /// positive would hijack the message into the snipe wizard.
+    #[test]
+    fn locator_detection_rejects_conversation() {
+        assert!(!looks_like_collection("snipe the new drop for me"));
+        assert!(!looks_like_collection("0xdeadbeef")); // too short for an address
+        assert!(!looks_like_collection(
+            "0x1234567890abcdef1234567890abcdef1234567g" // non-hex
+        ));
+        assert!(!looks_like_collection("https://example.com/collection/x"));
+        assert!(!looks_like_collection("check https://opensea.io/x please"));
+        assert!(!looks_like_collection(""));
+    }
+
+    #[test]
+    fn chain_is_lifted_from_item_and_asset_urls() {
+        assert_eq!(
+            infer_chain_from_url("https://opensea.io/item/base/0xabc/1").as_deref(),
+            Some("base")
+        );
+        assert_eq!(
+            infer_chain_from_url("https://opensea.io/assets/ethereum/0xabc/1").as_deref(),
+            Some("ethereum")
+        );
+        // Collection-slug URLs carry no chain — the wizard must still ask.
+        assert_eq!(
+            infer_chain_from_url("https://opensea.io/collection/some-drop"),
+            None
+        );
+        // An unsupported chain must not be silently coerced to a supported one.
+        assert_eq!(
+            infer_chain_from_url("https://opensea.io/assets/matic/0xabc/1"),
+            None
+        );
+    }
+
+    #[test]
+    fn short_messages_are_not_split() {
+        assert_eq!(split_message("hello"), vec!["hello".to_owned()]);
+    }
+
+    /// A 50-wallet listing exceeds Telegram's cap; every row must survive and
+    /// no chunk may exceed the limit.
+    #[test]
+    fn long_listings_split_on_line_boundaries() {
+        let listing = (0..200).fold(String::new(), |mut acc, index| {
+            let _ = writeln!(acc, "  {index}: 0x{index:040x} (qty 1)");
+            acc
+        });
+        let chunks = split_message(&listing);
+
+        assert!(chunks.len() > 1, "expected the listing to split");
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= MAX_MESSAGE_CHARS);
+        }
+        assert_eq!(chunks.concat(), listing, "no content may be lost");
+        for chunk in &chunks {
+            assert!(
+                chunk.starts_with("  "),
+                "chunks must begin at a row boundary, got: {chunk:.20}"
+            );
+        }
+    }
+
+    /// A single line longer than the cap has to be cut mid-line, and the cut
+    /// must land on a character boundary rather than inside a UTF-8 sequence.
+    #[test]
+    fn oversized_single_line_splits_on_char_boundaries() {
+        let line = "🦈".repeat(MAX_MESSAGE_CHARS + 500);
+        let chunks = split_message(&line);
+
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= MAX_MESSAGE_CHARS);
+        }
+        assert_eq!(chunks.concat(), line);
     }
 }

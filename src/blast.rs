@@ -12,7 +12,7 @@ use alloy_primitives::B256;
 use reqwest::{Client, header::CONTENT_TYPE};
 use serde_json::json;
 use thiserror::Error;
-use tokio::task::JoinHandle;
+use tokio::{task::JoinHandle, time::Instant};
 use url::Url;
 
 use crate::transaction::SignedTransaction;
@@ -34,6 +34,10 @@ pub struct BlastResult {
     pub label: String,
     pub tx_hash: Option<B256>,
     pub error: Option<String>,
+    /// Round-trip time from dispatch to this endpoint's reply. The whole point
+    /// of blasting is that the fastest endpoint wins, so recording which one
+    /// actually did turns endpoint choice into a measurement instead of a guess.
+    pub latency_ms: u128,
 }
 
 #[derive(Debug, Error)]
@@ -42,6 +46,12 @@ pub enum BlastError {
     Client,
 }
 
+/// Idle sockets retained per RPC host. A 50-wallet manifest dispatches 50
+/// concurrent sends to each endpoint, and a pool that only retains a couple of
+/// connections forces the rest to open new ones at the worst possible moment —
+/// during the fire. Sized to cover a large manifest with headroom.
+pub const POOL_MAX_IDLE_PER_HOST: usize = 64;
+
 /// Same connection tuning as the read gateway: keep-alive sockets with no idle
 /// timeout and adaptive HTTP/2 windows, so a warm connection never pays a
 /// handshake at fire time.
@@ -49,7 +59,7 @@ pub fn build_client() -> Result<Client, BlastError> {
     Client::builder()
         .timeout(Duration::from_secs(15))
         .pool_idle_timeout(None)
-        .pool_max_idle_per_host(2)
+        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
         .tcp_keepalive(Duration::from_mins(1))
         .http2_adaptive_window(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -150,6 +160,7 @@ pub fn blast_to_all(
             let label = endpoint.label.clone();
             let body = body.clone();
             tokio::spawn(async move {
+                let started = Instant::now();
                 // `body()` sets no Content-Type. Geth/reth reject a JSON-RPC
                 // POST without `application/json` with HTTP 415, so the header
                 // is mandatory here — `json()` sets it for us elsewhere, this
@@ -174,6 +185,7 @@ pub fn blast_to_all(
                                         label,
                                         tx_hash,
                                         error: None,
+                                        latency_ms: started.elapsed().as_millis(),
                                     };
                                 }
                                 let error = json
@@ -188,6 +200,7 @@ pub fn blast_to_all(
                                     label,
                                     tx_hash: None,
                                     error: Some(error),
+                                    latency_ms: started.elapsed().as_millis(),
                                 }
                             }
                             // A transport-level rejection (415, 429, 5xx) sends
@@ -201,6 +214,7 @@ pub fn blast_to_all(
                                 } else {
                                     format!("HTTP {status}")
                                 }),
+                                latency_ms: started.elapsed().as_millis(),
                             },
                         }
                     }
@@ -208,6 +222,7 @@ pub fn blast_to_all(
                         label,
                         tx_hash: None,
                         error: Some(error.to_string()),
+                        latency_ms: started.elapsed().as_millis(),
                     },
                 }
             })
@@ -229,6 +244,67 @@ pub fn is_accepted(results: &[BlastResult]) -> bool {
 fn is_already_known(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("already known") || lower.contains("already exists")
+}
+
+/// The endpoint that accepted this transaction fastest, with its round-trip
+/// time. `None` when no endpoint accepted it.
+#[must_use]
+pub fn winning_endpoint(results: &[BlastResult]) -> Option<(&str, u128)> {
+    results
+        .iter()
+        .filter(|result| result.tx_hash.is_some())
+        .min_by_key(|result| result.latency_ms)
+        .map(|result| (result.label.as_str(), result.latency_ms))
+}
+
+/// Per-endpoint acceptance counts and mean latency across a whole run, sorted
+/// fastest first. This is what turns "which RPC should I use?" from a guess
+/// into a number.
+#[must_use]
+pub fn endpoint_scoreboard(runs: &[&[BlastResult]]) -> Vec<EndpointStats> {
+    let mut stats: Vec<EndpointStats> = Vec::new();
+    for results in runs {
+        for result in *results {
+            let index =
+                if let Some(index) = stats.iter().position(|entry| entry.label == result.label) {
+                    index
+                } else {
+                    stats.push(EndpointStats {
+                        label: result.label.clone(),
+                        accepted: 0,
+                        attempts: 0,
+                        total_latency_ms: 0,
+                    });
+                    stats.len() - 1
+                };
+            let entry = &mut stats[index];
+            entry.attempts += 1;
+            entry.total_latency_ms += result.latency_ms;
+            if result.tx_hash.is_some() {
+                entry.accepted += 1;
+            }
+        }
+    }
+    stats.sort_by_key(EndpointStats::mean_latency_ms);
+    stats
+}
+
+#[derive(Clone, Debug)]
+pub struct EndpointStats {
+    pub label: String,
+    pub accepted: usize,
+    pub attempts: usize,
+    pub total_latency_ms: u128,
+}
+
+impl EndpointStats {
+    #[must_use]
+    pub fn mean_latency_ms(&self) -> u128 {
+        if self.attempts == 0 {
+            return 0;
+        }
+        self.total_latency_ms / self.attempts as u128
+    }
 }
 
 /// Distinct rejection reasons across all endpoints, for reporting.
@@ -262,6 +338,62 @@ mod tests {
             "nonce too low - transaction already known"
         ));
         assert!(!is_already_known("insufficient funds for gas"));
+    }
+
+    fn result(label: &str, accepted: bool, latency_ms: u128) -> BlastResult {
+        BlastResult {
+            label: label.to_owned(),
+            tx_hash: accepted.then_some(B256::ZERO),
+            error: (!accepted).then(|| "rejected".to_owned()),
+            latency_ms,
+        }
+    }
+
+    #[test]
+    fn winner_is_the_fastest_accepting_endpoint() {
+        let results = vec![
+            result("slow.example", true, 400),
+            result("fast.example", true, 120),
+            // A rejection must never win, however fast it answered.
+            result("instant-reject.example", false, 5),
+        ];
+        assert_eq!(
+            winning_endpoint(&results),
+            Some(("fast.example", 120)),
+            "the fastest *accepting* endpoint wins"
+        );
+    }
+
+    #[test]
+    fn winner_is_none_when_every_endpoint_rejected() {
+        let results = vec![
+            result("a.example", false, 10),
+            result("b.example", false, 20),
+        ];
+        assert_eq!(winning_endpoint(&results), None);
+    }
+
+    #[test]
+    fn scoreboard_aggregates_across_wallets_and_sorts_by_latency() {
+        let wallet_one = vec![
+            result("slow.example", true, 300),
+            result("fast.example", true, 100),
+        ];
+        let wallet_two = vec![
+            result("slow.example", true, 500),
+            result("fast.example", false, 200),
+        ];
+        let runs: Vec<&[BlastResult]> = vec![&wallet_one, &wallet_two];
+        let board = endpoint_scoreboard(&runs);
+
+        assert_eq!(board.len(), 2);
+        assert_eq!(board[0].label, "fast.example", "fastest mean sorts first");
+        assert_eq!(board[0].mean_latency_ms(), 150);
+        assert_eq!(board[0].accepted, 1);
+        assert_eq!(board[0].attempts, 2);
+        assert_eq!(board[1].label, "slow.example");
+        assert_eq!(board[1].mean_latency_ms(), 400);
+        assert_eq!(board[1].accepted, 2);
     }
 
     /// Accept one request on loopback, return the raw head, and reply with a
