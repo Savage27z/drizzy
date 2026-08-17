@@ -297,6 +297,74 @@ Send `/help` from your allowed chat id to verify.
 
 ---
 
+<h2 align="center">Deploy on Zeabur</h2>
+
+Zeabur is a supported alternative to Railway. It auto-detects the same
+multi-stage `Dockerfile`, so nothing in the build changes — `railway.toml` is
+simply ignored, and the two platforms coexist in this repo.
+
+> [!IMPORTANT]
+> **The Free plan will not work.** Zeabur's Free plan auto-sleeps idle services
+> and wakes them "on the next incoming request". The bot long-polls Telegram: it
+> only makes *outbound* requests and never receives an inbound one, so nothing
+> can ever wake it. It would sleep silently and miss every scheduled mint. Use
+> the **Dev plan or higher**, which does not sleep.
+
+### 1. Create the service
+
+1. Zeabur dashboard: **Create Project → Add Service → Git** → pick `drizzy`.
+2. The `Dockerfile` is detected automatically and takes precedence over
+   zbpack's native Rust provider — no `zbpack.json` is needed.
+3. `CMD ["opensea-mint", "bot"]` is baked into the image, so there is no start
+   command to configure (this is what `railway.toml` supplies on Railway).
+
+Do **not** bind a domain. The bot exposes no port and serves no HTTP.
+
+### 2. Add a Volume
+
+**Volumes** tab → mount with Volume ID `data` and Mount Directory `/data`, then
+set `WALLETS_FILE=/data/wallets.json`.
+
+Mounting a volume disables Zeabur's zero-downtime restarts: each redeploy fully
+stops the old container before starting the new one. That is the behaviour you
+want here — overlapping instances are what cause Telegram to reject the second
+poller with a `409 Conflict`.
+
+> [!WARNING]
+> Zeabur **clears the mounted directory** when the volume is first attached.
+> Mount the volume *before* writing `wallets.json`, or export the manifest first
+> and re-import it afterwards.
+
+### 3. Environment variables
+
+Identical to the Railway table above — `BOT_TOKEN`, `ALLOWED_CHAT_IDS`,
+`RPC_URL_BOT`, `WALLETS_FILE`. Set them under the service's **Environment
+Variables** tab.
+
+### 4. First wallet setup
+
+Same two options as Railway — generate in the service terminal, or upload
+`wallets.json` to the bot chat:
+
+```bash
+opensea-mint wallets create --count 5 --quantity 1 --output /data/wallets.json
+```
+
+### 5. Run
+
+Watch the service logs: a successful start prints the bot username and the
+owner-only guard message. Send `/help` from an allowed chat id to verify.
+
+> [!NOTE]
+> Zeabur builds on ephemeral shared CI (2 vCPU / 4 GB on Free and Dev), separate
+> from the machine that runs the service. `CARGO_BUILD_JOBS=2` is already sized
+> for that builder. Whether the cached dependency stage survives between deploys
+> is not documented — if every deploy takes the full cold-build time rather than
+> the incremental ~2 min, that is why, and it is a platform property rather than
+> something this Dockerfile can fix.
+
+---
+
 <h2 align="center">Available Commands</h2>
 
 `wallets create` does not load `.env`; help and version output also exit before configuration is loaded. All operational network commands use the active `.env`.
