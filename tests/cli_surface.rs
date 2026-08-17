@@ -95,7 +95,7 @@ fn wallet_generator_works_without_env_and_refuses_overwrite() {
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&output).expect("generated manifest"))
             .expect("manifest JSON");
-    assert_eq!(manifest["version"], 1);
+    assert_eq!(manifest["version"], 2);
     assert_eq!(manifest["wallets"].as_array().expect("wallets").len(), 2);
     assert!(
         manifest["wallets"]

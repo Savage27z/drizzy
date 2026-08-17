@@ -9,7 +9,7 @@ use crate::signing::{WalletSigner, WalletSignerError};
 
 pub const MAX_SELF_FUNDED_WALLETS: usize = 10;
 
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 2;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -97,7 +97,7 @@ impl WalletManifest {
         }
         let raw: RawWalletManifest =
             serde_json::from_str(source).map_err(WalletManifestError::Json)?;
-        if raw.version != MANIFEST_VERSION {
+        if raw.version != 1 && raw.version != MANIFEST_VERSION {
             return Err(WalletManifestError::UnsupportedVersion);
         }
         if raw.wallets.is_empty() {
@@ -208,14 +208,12 @@ impl FundingRequirement {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawWalletManifest {
     version: u32,
     wallets: Vec<RawWalletEntry>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawWalletEntry {
     private_key: Zeroizing<String>,
     quantity: u64,
@@ -245,15 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields_duplicates_zero_quantity_and_bad_versions() {
-        let unknown = format!(
-            r#"{{"version":1,"wallets":[{{"private_key":"{FIRST_KEY}","quantity":1,"label":"x"}}]}}"#
-        );
-        assert!(matches!(
-            WalletManifest::from_json(&unknown),
-            Err(WalletManifestError::Json(_))
-        ));
-
+    fn rejects_duplicates_zero_quantity_and_bad_versions() {
         let duplicate = format!(
             r#"{{"version":1,"wallets":[{{"private_key":"{FIRST_KEY}","quantity":1}},{{"private_key":"{FIRST_KEY}","quantity":1}}]}}"#
         );
@@ -269,11 +259,20 @@ mod tests {
             Err(WalletManifestError::ZeroQuantity { index: 1 })
         ));
 
-        let unsupported = r#"{"version":2,"wallets":[]}"#;
+        let unsupported = r#"{"version":99,"wallets":[]}"#;
         assert!(matches!(
             WalletManifest::from_json(unsupported),
             Err(WalletManifestError::UnsupportedVersion)
         ));
+    }
+
+    #[test]
+    fn accepts_unknown_fields_for_forward_compatibility() {
+        let with_extra = format!(
+            r#"{{"version":2,"wallets":[{{"private_key":"{FIRST_KEY}","quantity":1,"label":"x"}}]}}"#
+        );
+        let manifest = WalletManifest::from_json(&with_extra).expect("should accept extra fields");
+        assert_eq!(manifest.len(), 1);
     }
 
     #[test]

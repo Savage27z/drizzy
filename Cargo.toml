@@ -25,6 +25,13 @@ alloy-sol-types = "=1.6.1"
 # and constant-time in software, which matters on a container with no
 # guaranteed AES-NI.
 argon2 = { version = "=0.5.3", features = ["std", "zeroize"] }
+# BIP-39 mnemonic generation (12 words, 128-bit entropy) + BIP-32 HD key
+# derivation (Ethereum BIP-44 path m/44'/60'/0'/0/i). Users write down 12
+# words and can recover all wallets independently of this bot. bip39 handles
+# phrase generation/parsing with configurable word count; bip32 provides the
+# HD derivation via the same k256 the rest of the crate uses.
+bip32 = { version = "=0.5.2", features = ["secp256k1"] }
+bip39 = { version = "=2.2.2", features = ["rand", "zeroize"] }
 chacha20poly1305 = { version = "=0.11.0", features = ["getrandom", "zeroize"] }
 clap = { version = "=4.6.0", features = ["derive"] }
 crossterm = { version = "=0.29.0", default-features = false, features = ["windows"] }

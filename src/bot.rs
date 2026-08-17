@@ -130,6 +130,7 @@ struct Bot {
     /// Chats that have been asked how many wallets to generate and whose next
     /// plain message is that count.
     awaiting_wallet_count: Mutex<HashSet<i64>>,
+    awaiting_recovery: Mutex<HashSet<i64>>,
 }
 
 impl Bot {
@@ -146,6 +147,7 @@ impl Bot {
             wizards: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
             awaiting_wallet_count: Mutex::new(HashSet::new()),
+            awaiting_recovery: Mutex::new(HashSet::new()),
         })
     }
 
@@ -439,12 +441,13 @@ Commands:\n\
 /wallets — list your wallets (addresses only)\n\
 /snipe — start a snipe wizard (collection → chain → qty → wallets → gas → early fire)\n\
 /withdraw <address> — sweep all your wallets to an address\n\
+/recover — restore wallets from your 12-word recovery phrase\n\
 /cancel — abandon the current wizard\n\
 /status — active snipe count\n\
 /help — this message\n\n\
 💡 Paste an OpenSea link or a 0x contract address to stage a snipe directly.\n\n\
-🔒 Your wallets are yours alone — each chat has its own manifest. Keys are held \
-server-side and never shown in chat.";
+🔒 Your wallets are yours alone — each chat has its own manifest. Keys are derived \
+from a unique 12-word phrase shown once at creation. Write it down — it's your backup.";
 
 async fn handle_text(bot: &Arc<Bot>, chat_id: i64, text: &str) {
     let trimmed = text.trim();
@@ -475,8 +478,12 @@ async fn handle_text(bot: &Arc<Bot>, chat_id: i64, text: &str) {
                     )
                     .await;
             }
+            "recover" => {
+                start_recovery(bot, chat_id).await;
+            }
             "cancel" => {
                 bot.wizards.lock().await.remove(&chat_id);
+                bot.awaiting_recovery.lock().await.remove(&chat_id);
                 let _ = bot.send(chat_id, "Wizard cancelled.").await;
             }
             "status" => {
@@ -495,8 +502,11 @@ async fn handle_text(bot: &Arc<Bot>, chat_id: i64, text: &str) {
         return;
     }
 
-    // A pending wallet-count answer outranks everything else: the user was
-    // just asked a question and their reply is that answer, not a snipe.
+    if bot.awaiting_recovery.lock().await.contains(&chat_id) {
+        handle_recovery_phrase(bot, chat_id, trimmed).await;
+        return;
+    }
+
     if bot.awaiting_wallet_count.lock().await.contains(&chat_id) {
         create_wallets_from_text(bot, chat_id, trimmed).await;
         return;
@@ -677,13 +687,24 @@ async fn create_wallets(bot: &Arc<Bot>, chat_id: i64, count: usize) {
         return;
     }
 
-    // Clear the pending question before doing the work, so a failure does not
-    // leave the chat stuck answering a question it can no longer complete.
     bot.awaiting_wallet_count.lock().await.remove(&chat_id);
 
     let path = bot.manifest_path(chat_id);
     match wallet_generator::create_wallet_manifest(&path, count, 1) {
         Ok(manifest) => {
+            let _ = bot
+                .send(
+                    chat_id,
+                    &format!(
+                        "🔑 RECOVERY PHRASE — write this down NOW and store it safely.\n\n\
+                         `{}`\n\n\
+                         ⚠️ This is the ONLY time you'll see it. Anyone with these 12 words \
+                         can recover all your wallets. If you lose them, your funds are gone.\n\n\
+                         You can restore with /recover from any chat.",
+                        manifest.mnemonic()
+                    ),
+                )
+                .await;
             let mut lines = format!("✅ Created {count} wallet(s). Fund these addresses:\n\n");
             for (index, address) in manifest.addresses().iter().enumerate() {
                 let _ = writeln!(lines, "  {index}: `{address}`");
@@ -697,6 +718,81 @@ async fn create_wallets(bot: &Arc<Bot>, chat_id: i64, count: usize) {
         Err(error) => {
             let _ = bot
                 .send(chat_id, &format!("❌ Could not create wallets: {error}"))
+                .await;
+        }
+    }
+}
+
+async fn start_recovery(bot: &Arc<Bot>, chat_id: i64) {
+    if bot.has_manifest(chat_id) {
+        let _ = bot
+            .send(
+                chat_id,
+                "⚠️ You already have wallets. Recovery would overwrite them.\n\n\
+                 /withdraw your funds first, then delete the manifest to recover into a fresh one.\n\
+                 Or start over with /start.",
+            )
+            .await;
+        return;
+    }
+    bot.awaiting_recovery.lock().await.insert(chat_id);
+    let _ = bot
+        .send(
+            chat_id,
+            "🔑 Send your 12-word recovery phrase.\n\n\
+             The same wallets will be re-derived in the same order. \
+             /cancel to abort.",
+        )
+        .await;
+}
+
+async fn handle_recovery_phrase(bot: &Arc<Bot>, chat_id: i64, text: &str) {
+    bot.awaiting_recovery.lock().await.remove(&chat_id);
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if !matches!(words.len(), 12 | 15 | 18 | 21 | 24) {
+        let _ = bot
+            .send(
+                chat_id,
+                &format!(
+                    "Expected 12 or 24 words, got {}. Send your full recovery phrase separated by spaces, or /cancel.",
+                    words.len()
+                ),
+            )
+            .await;
+        bot.awaiting_recovery.lock().await.insert(chat_id);
+        return;
+    }
+
+    let phrase = words.join(" ");
+    let count = 5;
+    let path = bot.manifest_path(chat_id);
+
+    match wallet_generator::recover_wallet_manifest(&path, &phrase, count, 1) {
+        Ok(manifest) => {
+            let mut lines =
+                format!("✅ Recovered {count} wallet(s) from your phrase. Addresses:\n\n");
+            for (index, address) in manifest.addresses().iter().enumerate() {
+                let _ = writeln!(lines, "  {index}: `{address}`");
+            }
+            lines.push_str(
+                "\nVerify these match what you had before. If you need more, \
+                 /withdraw first and /start fresh with a higher count.\n\n\
+                 Then /snipe, or paste an OpenSea link.",
+            );
+            let _ = bot.send(chat_id, &lines).await;
+        }
+        Err(wallet_generator::WalletGeneratorError::InvalidMnemonic) => {
+            let _ = bot
+                .send(
+                    chat_id,
+                    "❌ Invalid recovery phrase. Check spelling — every word must be from the BIP-39 English word list.",
+                )
+                .await;
+        }
+        Err(error) => {
+            let _ = bot
+                .send(chat_id, &format!("❌ Recovery failed: {error}"))
                 .await;
         }
     }
