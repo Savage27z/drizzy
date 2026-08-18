@@ -30,6 +30,7 @@ argon2 = { version = "=0.5.3", features = ["std", "zeroize"] }
 # words and can recover all wallets independently of this bot. bip39 handles
 # phrase generation/parsing with configurable word count; bip32 provides the
 # HD derivation via the same k256 the rest of the crate uses.
+bytes = "=1.12.1"
 bip32 = { version = "=0.5.2", features = ["secp256k1"] }
 bip39 = { version = "=2.2.2", features = ["rand", "zeroize"] }
 chacha20poly1305 = { version = "=0.11.0", features = ["getrandom", "zeroize"] }

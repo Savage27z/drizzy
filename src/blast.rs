@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use alloy_primitives::B256;
+use bytes::Bytes;
 use reqwest::{Client, header::CONTENT_TYPE};
 use serde_json::json;
 use thiserror::Error;
@@ -46,11 +47,7 @@ pub enum BlastError {
     Client,
 }
 
-/// Idle sockets retained per RPC host. A 50-wallet manifest dispatches 50
-/// concurrent sends to each endpoint, and a pool that only retains a couple of
-/// connections forces the rest to open new ones at the worst possible moment —
-/// during the fire. Sized to cover a large manifest with headroom.
-pub const POOL_MAX_IDLE_PER_HOST: usize = 64;
+pub const POOL_MAX_IDLE_PER_HOST: usize = 128;
 
 /// Same connection tuning as the read gateway: keep-alive sockets with no idle
 /// timeout and adaptive HTTP/2 windows, so a warm connection never pays a
@@ -149,7 +146,7 @@ pub fn blast_to_all(
     prepared: &PreparedBlast,
     endpoints: &[RpcEndpoint],
 ) -> Vec<JoinHandle<BlastResult>> {
-    let body = prepared.body.clone();
+    let body: Bytes = Bytes::from(prepared.body.clone());
     let expected_hash = prepared.tx_hash;
 
     endpoints

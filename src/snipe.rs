@@ -39,7 +39,7 @@ use crate::{
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on simultaneous balance/nonce reads while arming. High enough that a
 /// large manifest arms quickly, low enough to stay under provider rate limits.
-const MAX_CONCURRENT_ACCOUNT_READS: usize = 8;
+const MAX_CONCURRENT_ACCOUNT_READS: usize = 16;
 const RECEIPT_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_GAS_LIMIT: u64 = 250_000;
 const GWEI: u128 = 1_000_000_000;
@@ -915,6 +915,15 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
         }
     }
 
+    // Build the blast client and start warming sockets NOW — the TCP/TLS
+    // handshakes run in the background while we validate balances and sign.
+    let blast_client = blast::build_client()?;
+    let warm_handle = {
+        let client = blast_client.clone();
+        let eps = endpoints.clone();
+        tokio::spawn(async move { blast::warm_connections(&client, &eps).await })
+    };
+
     let mut total_spend = U256::ZERO;
     let mut prepared: Vec<PreparedWallet> = Vec::new();
     for ((index, (signer, _quantity, plan)), account) in plans.iter().enumerate().zip(accounts) {
@@ -970,9 +979,8 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
         prepared.len()
     ));
 
-    // ── Warm sockets ──
-    let blast_client = blast::build_client()?;
-    blast::warm_connections(&blast_client, &endpoints).await;
+    // Ensure sockets are warm before entering the timing gate.
+    let _ = warm_handle.await;
 
     // ── Timing: wait for the stage, then fire pre-built bytes ──
     let stage_start = i64::try_from(drop.start_time)
@@ -995,15 +1003,14 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
     }
 
     let dispatch_start = Instant::now();
-    let mut fired: Vec<FiredWallet> = Vec::new();
-    for wallet in &prepared {
-        let handles = blast::blast_to_all(&blast_client, &wallet.blast, &endpoints);
-        fired.push(FiredWallet {
+    let fired: Vec<FiredWallet> = prepared
+        .iter()
+        .map(|wallet| FiredWallet {
             index: wallet.index,
             address: wallet.address,
-            handles,
-        });
-    }
+            handles: blast::blast_to_all(&blast_client, &wallet.blast, &endpoints),
+        })
+        .collect();
     let dispatch_ms = dispatch_start.elapsed().as_millis();
     let since_stage = (unix_millis() - stage_start).max(0);
     emit_success!(format!(
