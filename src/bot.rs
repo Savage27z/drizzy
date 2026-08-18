@@ -1139,7 +1139,11 @@ async fn advance_wizard(bot: &Arc<Bot>, chat_id: i64, text: &str) {
         },
         Step::Wallets => match parse_wallet_selection(text) {
             Ok(selection) => {
-                wizard.wallets = Some(selection);
+                wizard.wallets = if selection.is_empty() {
+                    None
+                } else {
+                    Some(selection)
+                };
                 wizard.step = Step::Gas;
                 *bot.wizards
                     .lock()
