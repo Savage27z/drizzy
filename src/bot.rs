@@ -435,19 +435,18 @@ async fn handle_update(bot: &Arc<Bot>, update: Value) {
     }
 }
 
-const HELP: &str = "🦈 SeaDrop sniper bot\n\n\
-Commands:\n\
-/start — create your wallets (first run)\n\
-/wallets — list your wallets (addresses only)\n\
-/snipe — start a snipe wizard (collection → chain → qty → wallets → gas → early fire)\n\
-/withdraw <address> — sweep all your wallets to an address\n\
-/recover — restore wallets from your 12-word recovery phrase\n\
-/cancel — abandon the current wizard\n\
-/status — active snipe count\n\
-/help — this message\n\n\
-💡 Paste an OpenSea link or a 0x contract address to stage a snipe directly.\n\n\
-🔒 Your wallets are yours alone — each chat has its own manifest. Keys are derived \
-from a unique 12-word phrase shown once at creation. Write it down — it's your backup.";
+const HELP: &str = "\
+*Drizzy — NFT Mint Sniper*\n\n\
+/start — Set up wallets\n\
+/wallets — View addresses\n\
+/snipe — New snipe\n\
+/withdraw `<address>` — Withdraw funds\n\
+/recover — Restore from recovery phrase\n\
+/cancel — Cancel current operation\n\
+/status — Active snipes\n\
+/help — Commands\n\n\
+You can also paste an OpenSea link or contract address directly.\n\n\
+_Wallets are isolated per chat. Your 12-word recovery phrase is the only backup — store it offline._";
 
 async fn handle_text(bot: &Arc<Bot>, chat_id: i64, text: &str) {
     let trimmed = text.trim();
@@ -474,7 +473,7 @@ async fn handle_text(bot: &Arc<Bot>, chat_id: i64, text: &str) {
                 let _ = bot
                     .send(
                         chat_id,
-                        "🎯 Start a snipe.\n\nSend the collection: an OpenSea link, a slug, or the 0x contract address.\n\n/cancel to abort.",
+                        "Send the collection — an OpenSea link, slug, or contract address.\n\n/cancel to abort.",
                     )
                     .await;
             }
@@ -639,7 +638,7 @@ async fn start_onboarding(bot: &Arc<Bot>, chat_id: i64) {
         let _ = bot
             .send(
                 chat_id,
-                "👋 You already have wallets. /wallets to list them, /snipe to mint, /withdraw to sweep them out.",
+                "Wallets already configured. Use /wallets, /snipe, or /withdraw.",
             )
             .await;
         return;
@@ -650,11 +649,10 @@ async fn start_onboarding(bot: &Arc<Bot>, chat_id: i64) {
         .send_keyboard(
             chat_id,
             &format!(
-                "👋 Welcome. Let's create your wallets.\n\n\
-                 They're generated on the server and belong to this chat only — nobody else can \
-                 see or spend them. You fund them, and /withdraw sweeps them back out whenever \
-                 you want.\n\n\
-                 How many? (1–{MAX_WALLETS_PER_USER}, or send a number)"
+                "Welcome to *Drizzy*.\n\n\
+                 Select the number of wallets to generate. Each wallet is unique to this chat \
+                 and secured with a 12-word recovery phrase.\n\n\
+                 How many? (1–{MAX_WALLETS_PER_USER})"
             ),
             &[&[("3", "wallets:3"), ("5", "wallets:5"), ("10", "wallets:10")]],
         )
@@ -696,22 +694,21 @@ async fn create_wallets(bot: &Arc<Bot>, chat_id: i64, count: usize) {
                 .send(
                     chat_id,
                     &format!(
-                        "🔑 RECOVERY PHRASE — write this down NOW and store it safely.\n\n\
+                        "*Recovery Phrase*\n\n\
                          `{}`\n\n\
-                         ⚠️ This is the ONLY time you'll see it. Anyone with these 12 words \
-                         can recover all your wallets. If you lose them, your funds are gone.\n\n\
-                         You can restore with /recover from any chat.",
+                         Save these 12 words offline. This is the only time they will be displayed. \
+                         Use /recover to restore wallets from this phrase.",
                         manifest.mnemonic()
                     ),
                 )
                 .await;
-            let mut lines = format!("✅ Created {count} wallet(s). Fund these addresses:\n\n");
+            let mut lines = format!("*{count} wallet(s) created.*\n\n");
             for (index, address) in manifest.addresses().iter().enumerate() {
-                let _ = writeln!(lines, "  {index}: `{address}`");
+                let _ = writeln!(lines, "`{index}` — `{address}`");
             }
             lines.push_str(
-                "\nSend each one the mint price plus a little gas — no more than you're willing \
-                 to lose on a drop.\n\nThen /snipe, or paste an OpenSea link.",
+                "\nFund each address with the mint price + gas. \
+                 Then use /snipe or paste an OpenSea link to begin.",
             );
             let _ = bot.send(chat_id, &lines).await;
         }
@@ -728,9 +725,7 @@ async fn start_recovery(bot: &Arc<Bot>, chat_id: i64) {
         let _ = bot
             .send(
                 chat_id,
-                "⚠️ You already have wallets. Recovery would overwrite them.\n\n\
-                 /withdraw your funds first, then delete the manifest to recover into a fresh one.\n\
-                 Or start over with /start.",
+                "Wallets already exist. Run /withdraw first, then /start to set up new ones.",
             )
             .await;
         return;
@@ -739,8 +734,7 @@ async fn start_recovery(bot: &Arc<Bot>, chat_id: i64) {
     let _ = bot
         .send(
             chat_id,
-            "🔑 Send your 12-word recovery phrase.\n\n\
-             The same wallets will be re-derived in the same order. \
+            "Send your 12-word recovery phrase. Wallets will be re-derived in the original order.\n\n\
              /cancel to abort.",
         )
         .await;
