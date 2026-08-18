@@ -208,6 +208,7 @@ impl Bot {
                 json!({
                     "chat_id": chat_id,
                     "text": chunk,
+                    "parse_mode": "Markdown",
                     "disable_web_page_preview": true,
                 }),
             )
@@ -235,6 +236,7 @@ impl Bot {
             json!({
                 "chat_id": chat_id,
                 "text": text,
+                "parse_mode": "Markdown",
                 "disable_web_page_preview": true,
                 "reply_markup": {"inline_keyboard": keyboard},
             }),
@@ -437,16 +439,15 @@ async fn handle_update(bot: &Arc<Bot>, update: Value) {
 
 const HELP: &str = "\
 *Drizzy — NFT Mint Sniper*\n\n\
-/start — Set up wallets\n\
-/wallets — View addresses\n\
+/start — Main menu\n\
 /snipe — New snipe\n\
+/wallets — View addresses\n\
 /withdraw `<address>` — Withdraw funds\n\
 /recover — Restore from recovery phrase\n\
-/cancel — Cancel current operation\n\
 /status — Active snipes\n\
+/cancel — Cancel current operation\n\
 /help — Commands\n\n\
-You can also paste an OpenSea link or contract address directly.\n\n\
-_Wallets are isolated per chat. Your 12-word recovery phrase is the only backup — store it offline._";
+_You can also paste an OpenSea link or contract address directly._";
 
 async fn handle_text(bot: &Arc<Bot>, chat_id: i64, text: &str) {
     let trimmed = text.trim();
@@ -490,7 +491,7 @@ async fn handle_text(bot: &Arc<Bot>, chat_id: i64, text: &str) {
                 let _ = bot
                     .send(
                         chat_id,
-                        &format!("🟢 active snipe(s) in flight: {active}\n🔴 idle"),
+                        &format!("Active snipes: {active}"),
                     )
                     .await;
             }
@@ -542,7 +543,7 @@ async fn handle_natural_language(bot: &Arc<Bot>, chat_id: i64, text: &str) {
     let reply = match assistant::interpret(text, wallets_available).await {
         Ok(reply) => reply,
         Err(error) => {
-            let _ = bot.send(chat_id, &format!("❌ {error}")).await;
+            let _ = bot.send(chat_id, &format!("Error: {error}")).await;
             return;
         }
     };
@@ -581,7 +582,7 @@ async fn handle_natural_language(bot: &Arc<Bot>, chat_id: i64, text: &str) {
         let _ = bot
             .send_keyboard(
                 chat_id,
-                &format!("🤖 {}\n\nWhich chain?", proposal.interpretation),
+                &format!("{}\n\nWhich chain?", proposal.interpretation),
                 &[&[
                     ("Base", "chain:base"),
                     ("Ethereum", "chain:ethereum"),
@@ -595,7 +596,7 @@ async fn handle_natural_language(bot: &Arc<Bot>, chat_id: i64, text: &str) {
     wizard.step = Step::Confirm;
     bot.wizards.lock().await.insert(chat_id, wizard.clone());
     let _ = bot
-        .send(chat_id, &format!("🤖 {}", proposal.interpretation))
+        .send(chat_id, &proposal.interpretation)
         .await;
     show_confirm(bot, chat_id, &wizard).await;
 }
@@ -635,12 +636,7 @@ fn prepare_encryption_at_rest(wallets_dir: &Path) -> Result<(), BotError> {
 /// generator refuses to overwrite anyway.
 async fn start_onboarding(bot: &Arc<Bot>, chat_id: i64) {
     if bot.has_manifest(chat_id) {
-        let _ = bot
-            .send(
-                chat_id,
-                "Wallets already configured. Use /wallets, /snipe, or /withdraw.",
-            )
-            .await;
+        send_main_menu(bot, chat_id).await;
         return;
     }
 
@@ -649,12 +645,38 @@ async fn start_onboarding(bot: &Arc<Bot>, chat_id: i64) {
         .send_keyboard(
             chat_id,
             &format!(
-                "Welcome to *Drizzy*.\n\n\
-                 Select the number of wallets to generate. Each wallet is unique to this chat \
-                 and secured with a 12-word recovery phrase.\n\n\
-                 How many? (1–{MAX_WALLETS_PER_USER})"
+                "*Drizzy — NFT Mint Sniper*\n\n\
+                 Set up your wallets to get started. Each wallet is unique to this \
+                 chat and secured with a 12-word recovery phrase.\n\n\
+                 Select wallet count (1–{MAX_WALLETS_PER_USER}):"
             ),
-            &[&[("3", "wallets:3"), ("5", "wallets:5"), ("10", "wallets:10")]],
+            &[
+                &[("3", "wallets:3"), ("5", "wallets:5"), ("10", "wallets:10")],
+                &[("Recover Existing", "menu:recover")],
+            ],
+        )
+        .await;
+}
+
+async fn send_main_menu(bot: &Arc<Bot>, chat_id: i64) {
+    let wallet_count = match crate::multi_wallet::WalletManifest::load(&bot.manifest_path(chat_id))
+    {
+        Ok(manifest) => manifest.len(),
+        Err(_) => 0,
+    };
+    let _ = bot
+        .send_keyboard(
+            chat_id,
+            &format!(
+                "*Drizzy — NFT Mint Sniper*\n\n\
+                 Wallets: {wallet_count}\n\n\
+                 _Ethereum | Base | Robinhood Chain_"
+            ),
+            &[
+                &[("Snipe", "menu:snipe"), ("Wallets", "menu:wallets")],
+                &[("Withdraw", "menu:withdraw"), ("Status", "menu:status")],
+                &[("Help", "menu:help")],
+            ],
         )
         .await;
 }
@@ -714,7 +736,7 @@ async fn create_wallets(bot: &Arc<Bot>, chat_id: i64, count: usize) {
         }
         Err(error) => {
             let _ = bot
-                .send(chat_id, &format!("❌ Could not create wallets: {error}"))
+                .send(chat_id, &format!("Could not create wallets: {error}"))
                 .await;
         }
     }
@@ -765,14 +787,12 @@ async fn handle_recovery_phrase(bot: &Arc<Bot>, chat_id: i64, text: &str) {
     match wallet_generator::recover_wallet_manifest(&path, &phrase, count, 1) {
         Ok(manifest) => {
             let mut lines =
-                format!("✅ Recovered {count} wallet(s) from your phrase. Addresses:\n\n");
+                format!("*{count} wallet(s) recovered.*\n\n");
             for (index, address) in manifest.addresses().iter().enumerate() {
-                let _ = writeln!(lines, "  {index}: `{address}`");
+                let _ = writeln!(lines, "`{index}` — `{address}`");
             }
             lines.push_str(
-                "\nVerify these match what you had before. If you need more, \
-                 /withdraw first and /start fresh with a higher count.\n\n\
-                 Then /snipe, or paste an OpenSea link.",
+                "\nVerify these match your previous addresses. Use /snipe or paste an OpenSea link to begin.",
             );
             let _ = bot.send(chat_id, &lines).await;
         }
@@ -780,13 +800,13 @@ async fn handle_recovery_phrase(bot: &Arc<Bot>, chat_id: i64, text: &str) {
             let _ = bot
                 .send(
                     chat_id,
-                    "❌ Invalid recovery phrase. Check spelling — every word must be from the BIP-39 English word list.",
+                    "Invalid recovery phrase. Check spelling — every word must be from the BIP-39 English word list.",
                 )
                 .await;
         }
         Err(error) => {
             let _ = bot
-                .send(chat_id, &format!("❌ Recovery failed: {error}"))
+                .send(chat_id, &format!("Recovery failed: {error}"))
                 .await;
         }
     }
@@ -812,7 +832,7 @@ async fn handle_withdraw(bot: &Arc<Bot>, chat_id: i64, argument: &str) {
     let destination = match sweep::parse_destination(argument) {
         Ok(destination) => destination,
         Err(error) => {
-            let _ = bot.send(chat_id, &format!("❌ {error}")).await;
+            let _ = bot.send(chat_id, &format!("Error: {error}")).await;
             return;
         }
     };
@@ -833,7 +853,7 @@ async fn handle_withdraw(bot: &Arc<Bot>, chat_id: i64, argument: &str) {
     let _ = bot
         .send(
             chat_id,
-            &format!("🧹 Sweeping every wallet to {destination} on {chain}..."),
+            &format!("Sweeping all wallets to `{destination}` on {chain}..."),
         )
         .await;
 
@@ -848,12 +868,12 @@ async fn handle_withdraw(bot: &Arc<Bot>, chat_id: i64, argument: &str) {
     tokio::spawn(async move {
         let summary = match sweep::sweep(options).await {
             Ok(report) => format!(
-                "🧹 Swept {} of {} wallet(s), {} wei total.",
+                "Swept {} of {} wallet(s) — {} wei total.",
                 report.swept_count(),
                 report.outcomes.len(),
                 report.total_sent()
             ),
-            Err(error) => format!("❌ Sweep failed: {error}"),
+            Err(error) => format!("Sweep failed: {error}"),
         };
         let _ = forwarder.await;
         let _ = result_bot.send(chat_id, &summary).await;
@@ -867,25 +887,21 @@ async fn list_wallets(bot: &Arc<Bot>, chat_id: i64) -> Result<(), BotError> {
         Ok(wallets) if wallets.is_empty() => {
             bot.send(
                 chat_id,
-                "⚠️ Your manifest exists but holds no wallets. Send /start to create some.",
+                "Your manifest exists but holds no wallets. Send /start to create some.",
             )
             .await
         }
         Ok(wallets) => {
-            let mut lines = format!("🗂 Your wallets — {}:\n", wallets.len());
+            let mut lines = format!("*Wallets ({})*\n\n", wallets.len());
             for (index, address, quantity) in wallets {
-                let _ = writeln!(lines, "  {index}: `{address}` (qty {quantity})");
+                let _ = writeln!(lines, "`{index}` — `{address}` (qty {quantity})");
             }
-            let _ = writeln!(
-                lines,
-                "\nFund these, then /snipe. /withdraw to sweep them out."
-            );
             bot.send(chat_id, &lines).await
         }
         Err(_) => {
             bot.send(
                 chat_id,
-                "⚠️ You have no wallets yet.\n\nSend /start to create some.",
+                "You have no wallets yet.\n\nSend /start to create some.",
             )
             .await
         }
@@ -917,14 +933,14 @@ async fn handle_document(bot: &Arc<Bot>, chat_id: i64, message: &Value) {
         Ok(file) => file,
         Err(error) => {
             let _ = bot
-                .send(chat_id, &format!("❌ Could not fetch file: {error}"))
+                .send(chat_id, &format!("Could not fetch file: {error}"))
                 .await;
             return;
         }
     };
     let Some(file_path) = file.get("file_path").and_then(Value::as_str) else {
         let _ = bot
-            .send(chat_id, "❌ Telegram returned no file path.")
+            .send(chat_id, "Telegram returned no file path.")
             .await;
         return;
     };
@@ -936,14 +952,14 @@ async fn handle_document(bot: &Arc<Bot>, chat_id: i64, message: &Value) {
         let _ = bot
             .send(
                 chat_id,
-                "⚠️ You already have wallets. Importing would overwrite them and any funds they hold.\n\nSweep them out with /withdraw first, then re-import.",
+                "You already have wallets. Importing would overwrite them and any funds they hold.\n\nSweep them out with /withdraw first, then re-import.",
             )
             .await;
         return;
     }
     if let Err(error) = bot.download_file(file_path, &destination).await {
         let _ = bot
-            .send(chat_id, &format!("❌ Could not save file: {error}"))
+            .send(chat_id, &format!("Could not save file: {error}"))
             .await;
         return;
     }
@@ -957,7 +973,7 @@ async fn handle_document(bot: &Arc<Bot>, chat_id: i64, message: &Value) {
         let _ = bot
             .send(
                 chat_id,
-                &format!("❌ Could not encrypt the import: {error}"),
+                &format!("Could not encrypt the import: {error}"),
             )
             .await;
         return;
@@ -965,25 +981,65 @@ async fn handle_document(bot: &Arc<Bot>, chat_id: i64, message: &Value) {
     match bot.load_manifest(chat_id) {
         Ok(wallets) if wallets.is_empty() => {
             let _ = bot
-                .send(chat_id, "⚠️ The file parsed but contains no wallets.")
+                .send(chat_id, "The file parsed but contains no wallets.")
                 .await;
         }
         Ok(wallets) => {
-            let mut lines = format!("✅ Imported {} wallet(s):\n", wallets.len());
+            let mut lines = format!("*{} wallet(s) imported.*\n\n", wallets.len());
             for (index, address, quantity) in wallets {
-                let _ = writeln!(lines, "  {index}: `{address}` (qty {quantity})");
+                let _ = writeln!(lines, "`{index}` — `{address}` (qty {quantity})");
             }
             let _ = bot.send(chat_id, &lines).await;
         }
         Err(error) => {
             let _ = bot
-                .send(chat_id, &format!("❌ Invalid wallets.json: {error}"))
+                .send(chat_id, &format!("Invalid wallets.json: {error}"))
                 .await;
         }
     }
 }
 
 async fn handle_callback(bot: &Arc<Bot>, chat_id: i64, data: &str) {
+    match data {
+        "menu:snipe" => {
+            let mut wizards = bot.wizards.lock().await;
+            wizards.insert(chat_id, Wizard::new());
+            drop(wizards);
+            let _ = bot
+                .send(
+                    chat_id,
+                    "Send the collection — an OpenSea link, slug, or contract address.\n\n/cancel to abort.",
+                )
+                .await;
+            return;
+        }
+        "menu:wallets" => {
+            let _ = list_wallets(bot, chat_id).await;
+            return;
+        }
+        "menu:withdraw" => {
+            let _ = bot
+                .send(chat_id, "Send /withdraw `<address>` to sweep all wallets.")
+                .await;
+            return;
+        }
+        "menu:status" => {
+            let active = bot.active.lock().await.get(&chat_id).copied().unwrap_or(0);
+            let _ = bot
+                .send(chat_id, &format!("Active snipes: {active}"))
+                .await;
+            return;
+        }
+        "menu:help" => {
+            let _ = bot.send(chat_id, HELP).await;
+            return;
+        }
+        "menu:recover" => {
+            start_recovery(bot, chat_id).await;
+            return;
+        }
+        _ => {}
+    }
     if let Some(chain) = data.strip_prefix("chain:") {
         let mut wizards = bot.wizards.lock().await;
         if let Some(wizard) = wizards.get_mut(&chat_id)
@@ -1207,7 +1263,7 @@ async fn start_from_locator(bot: &Arc<Bot>, chat_id: i64, locator: &str) {
             .send(
                 chat_id,
                 &format!(
-                    "🎯 Staged `{}` on {chain}.\n\nQuantity per wallet? Send a number (default 1).\n\n/cancel to abort.",
+                    "Staged `{}` on {chain}.\n\nQuantity per wallet? Send a number (default 1).\n\n/cancel to abort.",
                     locator.trim()
                 ),
             )
@@ -1218,7 +1274,7 @@ async fn start_from_locator(bot: &Arc<Bot>, chat_id: i64, locator: &str) {
         let _ = bot
             .send_keyboard(
                 chat_id,
-                &format!("🎯 Staged `{}`.\n\nWhich chain?", locator.trim()),
+                &format!("Staged `{}`.\n\nWhich chain?", locator.trim()),
                 &[&[
                     ("Base", "chain:base"),
                     ("Ethereum", "chain:ethereum"),
@@ -1314,9 +1370,9 @@ async fn show_confirm(bot: &Arc<Bot>, chat_id: i64, wizard: &Wizard) {
             )
             .unwrap_or(i64::MAX);
             let stage_status = if i64::try_from(preview.start_time).unwrap_or(i64::MAX) <= now {
-                "🟢 live now"
+                "Live"
             } else {
-                "⏳ scheduled"
+                "Scheduled"
             };
             let wallet_label = match &wizard.wallets {
                 Some(indices) if !indices.is_empty() => {
@@ -1337,13 +1393,13 @@ async fn show_confirm(bot: &Arc<Bot>, chat_id: i64, wizard: &Wizard) {
                 (None, None) => "auto (chain estimate)".to_owned(),
             };
             let summary = format!(
-                "🎯 Snipe preview — {stage_status}\n\n\
-                 📦 {}\n\
-                 ⛓️ {}\n\
-                 💰 price {} wei ({:.4} ETH)\n\
-                 🗂 {wallet_label}\n\
-                 ⛽ {gas_label}\n\
-                 🔥 early fire: {} ms\n\n\
+                "*Snipe Preview* — {stage_status}\n\n\
+                 Contract: `{}`\n\
+                 Chain: {}\n\
+                 Price: {} wei ({:.4} ETH)\n\
+                 Wallets: {wallet_label}\n\
+                 Gas: {gas_label}\n\
+                 Early fire: {} ms\n\n\
                  Confirm?",
                 preview.nft_contract,
                 preview.chain_name,
@@ -1355,7 +1411,7 @@ async fn show_confirm(bot: &Arc<Bot>, chat_id: i64, wizard: &Wizard) {
                 .send_keyboard(
                     chat_id,
                     &summary,
-                    &[&[("✅ FIRE", "fire:yes"), ("❌ Cancel", "fire:no")]],
+                    &[&[("FIRE", "fire:yes"), ("Cancel", "fire:no")]],
                 )
                 .await;
         }
@@ -1364,7 +1420,7 @@ async fn show_confirm(bot: &Arc<Bot>, chat_id: i64, wizard: &Wizard) {
             let _ = bot
                 .send(
                     chat_id,
-                    &format!("❌ Cannot preview this snipe: {error}\n\nSend /snipe to try again."),
+                    &format!("Cannot preview this snipe: {error}\n\nSend /snipe to try again."),
                 )
                 .await;
         }
@@ -1414,12 +1470,12 @@ async fn fire_snipe(bot: &Arc<Bot>, chat_id: i64, wizard: Wizard) {
         let _ = bot_clone
             .send(
                 chat_id,
-                "🎯 Arming — signing is done before the stage opens; progress will stream here.",
+                "Arming snipe. Signing transactions — progress will stream here.",
             )
             .await;
         let result = snipe::run_snipe(options).await;
         if let Err(error) = result {
-            let _ = bot_clone.send(chat_id, &format!("❌ {error}")).await;
+            let _ = bot_clone.send(chat_id, &format!("Error: {error}")).await;
         }
         {
             let mut active = bot_clone.active.lock().await;
