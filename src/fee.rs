@@ -3,7 +3,6 @@ use crate::{
     config::{FeeMode, FeesConfig},
     domain::{AutomaticFeePolicy, Eip1559Fees, FeeError},
 };
-
 const AUTOMATIC_FEE_MULTIPLIER_BPS: u32 = 12_500;
 
 pub(crate) fn initial_transaction_fees(
