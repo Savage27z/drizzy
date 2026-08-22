@@ -54,6 +54,7 @@ impl AutomaticFeePolicy {
         let buffer = pending
             .max_fee_per_gas
             .checked_sub(pending.max_priority_fee_per_gas)
+            .ok_or(FeeError::Overflow)?;
     }
 }
 
