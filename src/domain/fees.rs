@@ -56,6 +56,7 @@ impl AutomaticFeePolicy {
             .checked_sub(pending.max_priority_fee_per_gas)
             .ok_or(FeeError::Overflow)?;
         let buffer_bump_bps = self.replacement_bump_bps.min(MAX_BASE_FEE_GROWTH_BPS);
+        let grown_buffer = multiply_ceil(buffer, buffer_bump_bps)?;
     }
 }
 
