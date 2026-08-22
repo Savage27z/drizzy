@@ -923,6 +923,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
                 // only to raise the limit, never to shrink it below the
                 // configured floor.
                 let padded = gas
+                    .checked_mul(SIMULATION_GAS_MARGIN_NUM)
             Err(_) if !stage_is_live => {
                 emit_info!(
                     "Simulation reverted, as expected before the stage opens — continuing to arm"
