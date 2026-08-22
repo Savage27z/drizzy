@@ -498,6 +498,7 @@ impl AppConfig {
             return Err(ConfigError::Validation(
                 "REPLACEMENT_BUMP_BPS must be between 10001 and 20000".into(),
             ));
+            ));
         }
         match self.fees.mode {
             FeeMode::Manual {
