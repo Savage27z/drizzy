@@ -63,6 +63,7 @@ impl AutomaticFeePolicy {
             .ok_or(FeeError::Overflow)?;
         Ok(Eip1559Fees {
             max_fee_per_gas,
+            max_priority_fee_per_gas,
     }
 }
 
