@@ -62,6 +62,7 @@ mod tests {
         assert_eq!(initial.max_fee_per_gas, U256::from(125_u64));
         assert_eq!(initial.max_priority_fee_per_gas, U256::from(10_u64));
 
+        // At the default 11_250 bps bump — exactly the protocol's own
         let maximum = maximum_transaction_fees(config, 3, initial).expect("maximum fees");
         assert_eq!(maximum.max_fee_per_gas, U256::from(159_u64));
         assert_eq!(maximum.max_priority_fee_per_gas, U256::from(14_u64));
