@@ -756,6 +756,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
     // Configured floor — used as-is unless a live simulation (below) shows the
     // mint actually needs more than this, in which case we raise it. We never
     // lower it: only the first wallet gets simulated, and other wallets in the
+    // batch may mint a larger quantity and therefore cost more gas.
     let read_client = reqwest::Client::new();
     let nft_contract = resolve_nft_contract(&options.collection, &read_client).await?;
     let candidates = resolve_rpc_candidates(&options)?;
