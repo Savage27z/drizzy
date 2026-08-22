@@ -928,6 +928,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
                     .unwrap_or(gas_limit);
                 if padded > gas_limit {
                     emit_info!(format!(
+                        "Simulation OK — mint would use ~{gas} gas; raising gas limit {gas_limit} -> {padded} ({SIMULATION_GAS_MARGIN_NUM}/{SIMULATION_GAS_MARGIN_DEN}x margin over simulated cost)"
             Err(_) if !stage_is_live => {
                 emit_info!(
                     "Simulation reverted, as expected before the stage opens — continuing to arm"
