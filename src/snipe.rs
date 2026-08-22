@@ -753,7 +753,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
     // Load .env for RPC_URL / OPENSEA_API_KEY without requiring one.
     let _ = dotenvy::dotenv();
 
-    let gas_limit = options.gas_limit.max(21_000);
+    // Configured floor — used as-is unless a live simulation (below) shows the
     let read_client = reqwest::Client::new();
     let nft_contract = resolve_nft_contract(&options.collection, &read_client).await?;
     let candidates = resolve_rpc_candidates(&options)?;
