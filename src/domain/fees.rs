@@ -46,6 +46,7 @@ impl AutomaticFeePolicy {
         // inclusion race, so it escalates at the full configured rate.
         let max_priority_fee_per_gas =
             multiply_ceil(pending.max_priority_fee_per_gas, self.replacement_bump_bps)?;
+
     }
 }
 
