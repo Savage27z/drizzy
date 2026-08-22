@@ -52,9 +52,9 @@ const GWEI: u128 = 1_000_000_000;
 
 /// Chain registry — mirrors `nft-public-mint/src/chains.ts`. Everything
 /// chain-specific lives here so adding a network is a single entry.
-struct ChainProfile {
-    key: &'static str,
-    chain_id: u64,
+pub(crate) struct ChainProfile {
+    pub(crate) key: &'static str,
+    pub(crate) chain_id: u64,
     explorer: &'static str,
     alchemy_host: &'static str,
     public_rpcs: &'static [&'static str],
@@ -99,7 +99,7 @@ const CHAINS: &[ChainProfile] = &[
 
 const DEFAULT_EXPLORER: &str = "https://basescan.org";
 
-fn resolve_chain(key: &str) -> Option<&'static ChainProfile> {
+pub(crate) fn resolve_chain(key: &str) -> Option<&'static ChainProfile> {
     CHAINS.iter().find(|profile| profile.key == key)
 }
 
@@ -110,11 +110,11 @@ pub fn public_rpcs_for(chain: &str) -> Option<(u64, &'static [&'static str])> {
     resolve_chain(chain).map(|profile| (profile.chain_id, profile.public_rpcs))
 }
 
-fn chain_by_id(chain_id: u64) -> Option<&'static ChainProfile> {
+pub(crate) fn chain_by_id(chain_id: u64) -> Option<&'static ChainProfile> {
     CHAINS.iter().find(|profile| profile.chain_id == chain_id)
 }
 
-fn explorer_url(chain_id: u64, tx_hash: &str) -> String {
+pub(crate) fn explorer_url(chain_id: u64, tx_hash: &str) -> String {
     let base = chain_by_id(chain_id).map_or(DEFAULT_EXPLORER, |profile| profile.explorer);
     format!("{base}/tx/{tx_hash}")
 }
@@ -285,7 +285,7 @@ fn format_gwei(wei: U256) -> String {
 /// Resolve a collection locator (address, URL, or slug) to a contract address.
 /// Slug lookups hit `OpenSea`'s public v2 collections endpoint; the key is
 /// optional and only used when `OPENSEA_API_KEY` is set.
-async fn resolve_nft_contract(
+pub(crate) async fn resolve_nft_contract(
     locator: &str,
     client: &reqwest::Client,
 ) -> Result<Address, SnipeError> {
@@ -388,7 +388,7 @@ fn order_endpoints(working: Vec<(Url, u64)>) -> Vec<(Url, u64)> {
     reads
 }
 
-async fn run_probe(
+pub(crate) async fn run_probe(
     gateway: &ChainGateway,
     candidates: &[Url],
     expected_chain_id: Option<u64>,
@@ -463,11 +463,17 @@ fn validate_rpc_url(url: &Url) -> bool {
     false
 }
 
-fn resolve_rpc_candidates(options: &SnipeOptions) -> Result<Vec<Url>, SnipeError> {
-    let profile = options.chain.as_deref().and_then(resolve_chain);
+/// Shared by every local on-chain flow (self-funded snipe, sponsored snipe):
+/// explicit `--rpc`/`rpc_urls` beat `RPC_URL`, which beats the chain's public
+/// defaults.
+pub(crate) fn resolve_rpc_candidates(
+    rpc_urls: &[String],
+    chain: Option<&str>,
+) -> Result<Vec<Url>, SnipeError> {
+    let profile = chain.and_then(resolve_chain);
     let mut urls: Vec<Url> = Vec::new();
 
-    for raw in &options.rpc_urls {
+    for raw in rpc_urls {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             continue;
@@ -558,7 +564,7 @@ fn load_wallets(options: &SnipeOptions) -> Result<Vec<(WalletSigner, u64)>, Snip
 /// Wait until `fire_time_millis` (unix epoch milliseconds), with a countdown
 /// while far away and a tight spin-wait for the final milliseconds — the
 /// sub-millisecond precision that makes a pre-signed blast land at T-0.
-async fn wait_until_fire(fire_time_millis: i64, stage_label: &str) {
+pub(crate) async fn wait_until_fire(fire_time_millis: i64, stage_label: &str) {
     let now = unix_millis();
     let remaining = fire_time_millis - now;
     if remaining <= 0 {
@@ -592,7 +598,7 @@ async fn wait_until_fire(fire_time_millis: i64, stage_label: &str) {
     logging::success("FIRING!");
 }
 
-fn unix_millis() -> i64 {
+pub(crate) fn unix_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| {
@@ -636,7 +642,7 @@ async fn collect_results(
     (accepted, rejected)
 }
 
-async fn wait_for_receipt(
+pub(crate) async fn wait_for_receipt(
     gateway: &ChainGateway,
     config: &ChainConfig,
     tx_hash: &str,
@@ -684,7 +690,7 @@ pub async fn preview(options: &SnipeOptions) -> Result<SnipePreview, SnipeError>
     let _ = dotenvy::dotenv();
     let read_client = reqwest::Client::new();
     let nft_contract = resolve_nft_contract(&options.collection, &read_client).await?;
-    let candidates = resolve_rpc_candidates(options)?;
+    let candidates = resolve_rpc_candidates(&options.rpc_urls, options.chain.as_deref())?;
     let gateway = ChainGateway::new(READ_TIMEOUT)?;
     let expected_chain_id = options
         .chain
@@ -753,6 +759,17 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
     // Load .env for RPC_URL / OPENSEA_API_KEY without requiring one.
     let _ = dotenvy::dotenv();
 
+    // Latency breakdown, named to match the stages a mint-ops dashboard
+    // reports: worker pickup (queue delay before this task started running —
+    // sub-ms here, since arming begins the instant this function is called,
+    // with no queue in between), sign/pre-sign (below), sendRaw latency (the
+    // per-endpoint accept latency already tracked via `winning_endpoint`),
+    // and time-to-landed (fire moment -> confirmed receipt). We deliberately
+    // don't claim a "time to seen" figure: that needs an independent
+    // mempool observer, which we don't have — reporting our own RPC's accept
+    // latency under that name would overstate what it actually measures.
+    let run_start = Instant::now();
+
     // Configured floor — used as-is unless a live simulation (below) shows the
     // mint actually needs more than this, in which case we raise it. We never
     // lower it: only the first wallet gets simulated, and other wallets in the
@@ -760,7 +777,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
     let mut gas_limit = options.gas_limit.max(21_000);
     let read_client = reqwest::Client::new();
     let nft_contract = resolve_nft_contract(&options.collection, &read_client).await?;
-    let candidates = resolve_rpc_candidates(&options)?;
+    let candidates = resolve_rpc_candidates(&options.rpc_urls, options.chain.as_deref())?;
 
     let gateway = ChainGateway::new(READ_TIMEOUT)?;
     let expected_chain_id = options
@@ -958,6 +975,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
 
     let mut total_spend = U256::ZERO;
     let mut prepared: Vec<PreparedWallet> = Vec::new();
+    let sign_start = Instant::now();
     for ((index, (signer, _quantity, plan)), account) in plans.iter().enumerate().zip(accounts) {
         let required = plan
             .value
@@ -1006,9 +1024,14 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
             blast: blast::prepare_blast(&signed),
         });
     }
+    let sign_ms = sign_start.elapsed().as_millis();
     emit_success!(format!(
         "{} tx(s) signed and serialised — nothing left to compute at fire time",
         prepared.len()
+    ));
+    emit_info!(format!(
+        "Latency: worker pickup ~0ms (no queue) | sign/pre-sign {sign_ms}ms | armed {}ms after start",
+        run_start.elapsed().as_millis()
     ));
 
     // Ensure sockets are warm before entering the timing gate.
@@ -1115,6 +1138,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
         } else {
             wait_for_receipt(&gateway, &config, &tx_hash).await?
         };
+        let landed_ms = dispatch_start.elapsed().as_millis();
         match receipt {
             Some(receipt) => {
                 let status = if receipt.is_success {
@@ -1124,12 +1148,12 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
                 };
                 if receipt.is_success {
                     emit_success!(format!(
-                        "[W{index}] {address} | block {} | {status}",
+                        "[W{index}] {address} | block {} | {status} | time to landed {landed_ms}ms",
                         receipt.block_number
                     ));
                 } else {
                     emit_error!(format!(
-                        "[W{index}] {address} | block {} | {status}",
+                        "[W{index}] {address} | block {} | {status} | time to landed {landed_ms}ms",
                         receipt.block_number
                     ));
                 }
