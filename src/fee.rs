@@ -88,6 +88,7 @@ mod tests {
             max_priority_fee_per_gas: U256::from(100_000_u64),
         };
         let policy = AutomaticFeePolicy::new(10_000, config.replacement_bump_bps)
+            .expect("valid policy");
     }
 
     #[test]
