@@ -60,6 +60,7 @@ impl AutomaticFeePolicy {
 
         let max_fee_per_gas = max_priority_fee_per_gas
             .checked_add(grown_buffer)
+            .ok_or(FeeError::Overflow)?;
     }
 }
 
