@@ -109,6 +109,7 @@ mod tests {
                 max_priority_fee_per_gas: U256::from(5_u64),
             },
             replacement_bump_bps: 11_250,
+            initial_multiplier_bps: 12_500,
         };
         let fees = initial_transaction_fees(
             config,
