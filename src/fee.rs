@@ -70,6 +70,7 @@ mod tests {
         assert_eq!(maximum.max_fee_per_gas, U256::from(161_u64));
         assert_eq!(maximum.max_priority_fee_per_gas, U256::from(14_u64));
     }
+    }
 
     #[test]
     fn manual_fees_ignore_rpc_estimates() {
