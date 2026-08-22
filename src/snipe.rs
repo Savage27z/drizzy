@@ -945,6 +945,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
             Err(_) => return Err(SnipeError::SimulationReverted { address: sender }),
         }
     }
+    emit_info!(format!("Gas limit: {gas_limit}"));
 
     // Build the blast client and start warming sockets NOW — the TCP/TLS
     // handshakes run in the background while we validate balances and sign.
