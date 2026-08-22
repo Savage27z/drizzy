@@ -91,6 +91,7 @@ mod tests {
             .expect("valid policy");
         let bumped = policy.replacement(initial).expect("replacement fees");
 
+        // Tip escalates by the full configured 50%.
     }
 
     #[test]
