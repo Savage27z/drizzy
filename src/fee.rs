@@ -80,6 +80,7 @@ mod tests {
         // fully while the reserved buffer grows far more slowly.
         let config = FeesConfig {
             mode: FeeMode::Automatic,
+            replacement_bump_bps: 15_000,
     }
 
     #[test]
