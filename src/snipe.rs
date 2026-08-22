@@ -45,6 +45,7 @@ const DEFAULT_GAS_LIMIT: u64 = 250_000;
 /// Safety margin applied over a live `eth_estimateGas` simulation result
 /// before it's allowed to raise the effective gas limit above the configured
 /// floor: 13/10 = 30% headroom for gas price fluctuation between simulation
+/// and the actual mint transaction landing on-chain.
 const GWEI: u128 = 1_000_000_000;
 
 /// Chain registry — mirrors `nft-public-mint/src/chains.ts`. Everything
