@@ -501,6 +501,7 @@ impl AppConfig {
         }
         if !(10_000..=50_000).contains(&self.fees.initial_multiplier_bps) {
             return Err(ConfigError::Validation(
+                "INITIAL_FEE_MULTIPLIER_BPS must be between 10000 (no markup) and 50000".into(),
             ));
         }
         match self.fees.mode {
