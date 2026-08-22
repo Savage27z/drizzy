@@ -129,6 +129,7 @@ pub struct FeesConfig {
     pub replacement_bump_bps: u32,
     /// Cushion applied over the RPC's own fee estimate before the first
     /// attempt, in basis points (10_000 = no markup, 12_500 = the previous
+    /// hardcoded +25%). Was a private constant with no way to tune it per
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
