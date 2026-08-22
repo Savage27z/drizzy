@@ -127,6 +127,7 @@ pub struct RetryConfig {
 pub struct FeesConfig {
     pub mode: FeeMode,
     pub replacement_bump_bps: u32,
+    /// Cushion applied over the RPC's own fee estimate before the first
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
