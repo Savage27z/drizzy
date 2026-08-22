@@ -86,6 +86,7 @@ mod tests {
         let initial = Eip1559Fees {
             max_fee_per_gas: U256::from(1_000_000_u64),
             max_priority_fee_per_gas: U256::from(100_000_u64),
+        };
     }
 
     #[test]
