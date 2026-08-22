@@ -72,6 +72,7 @@ mod tests {
     }
 
     #[test]
+    fn caps_max_fee_buffer_growth_when_replacement_bump_outpaces_base_fee() {
     }
 
     #[test]
