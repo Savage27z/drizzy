@@ -925,6 +925,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
                 let padded = gas
                     .checked_mul(SIMULATION_GAS_MARGIN_NUM)
                     .and_then(|value| value.checked_div(SIMULATION_GAS_MARGIN_DEN))
+                    .unwrap_or(gas_limit);
             Err(_) if !stage_is_live => {
                 emit_info!(
                     "Simulation reverted, as expected before the stage opens — continuing to arm"
