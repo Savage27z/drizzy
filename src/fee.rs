@@ -74,6 +74,7 @@ mod tests {
     #[test]
     fn caps_max_fee_buffer_growth_when_replacement_bump_outpaces_base_fee() {
         // A user who wants an aggressive 50%-per-attempt tip bump to win a
+        // hot mint's inclusion race (replacement_bump_bps: 15_000) still only
     }
 
     #[test]
