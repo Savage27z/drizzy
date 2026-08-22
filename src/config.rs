@@ -421,6 +421,7 @@ fn parse_fees(values: &mut BTreeMap<String, String>) -> Result<FeesConfig, Confi
     let is_automatic = parse_bool(&take_required(values, "FEE_AUTOMATIC")?, "FEE_AUTOMATIC")?;
     let replacement_bump_bps = take_u32_default(values, "REPLACEMENT_BUMP_BPS", 11_250)?;
     let initial_multiplier_bps =
+        take_u32_default(values, "INITIAL_FEE_MULTIPLIER_BPS", 12_500)?;
     let mode = if is_automatic {
         if values.contains_key("MAX_FEE_PER_GAS_GWEI")
             || values.contains_key("MAX_PRIORITY_FEE_PER_GAS_GWEI")
