@@ -42,6 +42,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_ACCOUNT_READS: usize = 16;
 const RECEIPT_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_GAS_LIMIT: u64 = 250_000;
+/// Safety margin applied over a live `eth_estimateGas` simulation result
 const GWEI: u128 = 1_000_000_000;
 
 /// Chain registry — mirrors `nft-public-mint/src/chains.ts`. Everything
