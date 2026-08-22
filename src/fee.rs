@@ -79,6 +79,7 @@ mod tests {
         // ceiling (12.5%/block) — not the same 50%. Confirm the tip escalates
         // fully while the reserved buffer grows far more slowly.
         let config = FeesConfig {
+            mode: FeeMode::Automatic,
     }
 
     #[test]
