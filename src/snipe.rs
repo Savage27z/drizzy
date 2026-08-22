@@ -47,6 +47,7 @@ const DEFAULT_GAS_LIMIT: u64 = 250_000;
 /// floor: 13/10 = 30% headroom for gas price fluctuation between simulation
 /// and the actual mint transaction landing on-chain.
 const SIMULATION_GAS_MARGIN_NUM: u64 = 13;
+const SIMULATION_GAS_MARGIN_DEN: u64 = 10;
 const GWEI: u128 = 1_000_000_000;
 
 /// Chain registry — mirrors `nft-public-mint/src/chains.ts`. Everything
