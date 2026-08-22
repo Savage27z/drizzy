@@ -78,6 +78,7 @@ mod tests {
         // needs the max_fee buffer to grow at the protocol's actual base-fee
         // ceiling (12.5%/block) — not the same 50%. Confirm the tip escalates
         // fully while the reserved buffer grows far more slowly.
+        let config = FeesConfig {
     }
 
     #[test]
