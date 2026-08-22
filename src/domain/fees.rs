@@ -11,6 +11,7 @@ const BASIS_POINTS: u32 = 10_000;
 /// benefit. Capping the buffer's growth here keeps every replacement fully
 /// safe (it can never fall behind the real base fee) while avoiding that
 /// waste whenever `replacement_bump_bps` is configured more aggressively
+/// than the protocol's own base-fee ceiling requires.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Eip1559Fees {
