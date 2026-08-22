@@ -97,6 +97,7 @@ mod tests {
         // pushing max_fee to 1_500_000 — instead it's capped at the
         // protocol's real 12.5% base-fee ceiling.
         let flat_bump_max_fee = U256::from(1_500_000_u64);
+        assert!(bumped.max_fee_per_gas < flat_bump_max_fee);
     }
 
     #[test]
