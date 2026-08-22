@@ -915,7 +915,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
             .estimate_transaction(&config, 1, sender, plan.to, plan.value, &plan.data)
             .await;
         match simulation {
-            Ok(gas) => emit_info!(format!("Simulation OK — mint would use ~{gas} gas")),
+            Ok(gas) => {
             Err(_) if !stage_is_live => {
                 emit_info!(
                     "Simulation reverted, as expected before the stage opens — continuing to arm"
