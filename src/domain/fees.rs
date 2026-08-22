@@ -10,6 +10,7 @@ const BASIS_POINTS: u32 = 10_000;
 /// race just inflates the wallet balance a wallet must reserve, for no real
 /// benefit. Capping the buffer's growth here keeps every replacement fully
 /// safe (it can never fall behind the real base fee) while avoiding that
+/// waste whenever `replacement_bump_bps` is configured more aggressively
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Eip1559Fees {
