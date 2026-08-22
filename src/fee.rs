@@ -10,7 +10,7 @@ pub(crate) fn initial_transaction_fees(
 ) -> Result<Eip1559Fees, FeeError> {
     match config.mode {
         FeeMode::Automatic => {
-            AutomaticFeePolicy::new(AUTOMATIC_FEE_MULTIPLIER_BPS, config.replacement_bump_bps)?
+            AutomaticFeePolicy::new(config.initial_multiplier_bps, config.replacement_bump_bps)?
                 .initial(Eip1559Fees {
                     max_fee_per_gas: estimate.max_fee_per_gas,
                     max_priority_fee_per_gas: estimate.max_priority_fee_per_gas,
