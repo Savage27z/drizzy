@@ -81,6 +81,7 @@ mod tests {
         let config = FeesConfig {
             mode: FeeMode::Automatic,
             replacement_bump_bps: 15_000,
+            initial_multiplier_bps: 12_500,
     }
 
     #[test]
