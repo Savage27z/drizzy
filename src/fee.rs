@@ -71,6 +71,7 @@ mod tests {
         assert_eq!(maximum.max_priority_fee_per_gas, U256::from(14_u64));
     }
 
+    #[test]
     }
 
     #[test]
