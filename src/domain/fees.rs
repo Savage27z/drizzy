@@ -12,6 +12,7 @@ const BASIS_POINTS: u32 = 10_000;
 /// safe (it can never fall behind the real base fee) while avoiding that
 /// waste whenever `replacement_bump_bps` is configured more aggressively
 /// than the protocol's own base-fee ceiling requires.
+const MAX_BASE_FEE_GROWTH_BPS: u32 = 11_250;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Eip1559Fees {
