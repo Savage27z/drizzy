@@ -500,6 +500,7 @@ impl AppConfig {
             ));
         }
         if !(10_000..=50_000).contains(&self.fees.initial_multiplier_bps) {
+            return Err(ConfigError::Validation(
             ));
         }
         match self.fees.mode {
