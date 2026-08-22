@@ -20,6 +20,7 @@ pub mod seadrop;
 pub mod signing;
 pub mod snipe;
 pub mod sponsored;
+pub mod sponsored_snipe;
 pub mod sweep;
 pub mod terminal;
 pub mod transaction;
