@@ -48,6 +48,7 @@ impl AutomaticFeePolicy {
             multiply_ceil(pending.max_priority_fee_per_gas, self.replacement_bump_bps)?;
 
         // The buffer above the tip exists only to stay ahead of base-fee
+        // growth, which cannot exceed MAX_BASE_FEE_GROWTH_BPS per block —
     }
 }
 
