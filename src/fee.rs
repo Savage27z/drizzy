@@ -93,6 +93,7 @@ mod tests {
 
         // Tip escalates by the full configured 50%.
         assert_eq!(bumped.max_priority_fee_per_gas, U256::from(150_000_u64));
+        // Buffer (900_000) would grow to 1_350_000 under a flat 50% bump,
     }
 
     #[test]
