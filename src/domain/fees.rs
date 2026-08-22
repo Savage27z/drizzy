@@ -3,6 +3,7 @@ use thiserror::Error;
 
 const BASIS_POINTS: u32 = 10_000;
 /// The protocol caps how fast the base fee itself can rise: at most 12.5%
+/// (1/8) per block (EIP-1559). `max_fee_per_gas` only needs headroom above
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Eip1559Fees {
