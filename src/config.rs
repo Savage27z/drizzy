@@ -420,6 +420,7 @@ fn environment_search_start(current: &Path, executable: &Path) -> PathBuf {
 fn parse_fees(values: &mut BTreeMap<String, String>) -> Result<FeesConfig, ConfigError> {
     let is_automatic = parse_bool(&take_required(values, "FEE_AUTOMATIC")?, "FEE_AUTOMATIC")?;
     let replacement_bump_bps = take_u32_default(values, "REPLACEMENT_BUMP_BPS", 11_250)?;
+    let initial_multiplier_bps =
     let mode = if is_automatic {
         if values.contains_key("MAX_FEE_PER_GAS_GWEI")
             || values.contains_key("MAX_PRIORITY_FEE_PER_GAS_GWEI")
