@@ -44,6 +44,7 @@ impl AutomaticFeePolicy {
     pub fn replacement(self, pending: Eip1559Fees) -> Result<Eip1559Fees, FeeError> {
         // The tip (max_priority_fee_per_gas) is what actually has to win the
         // inclusion race, so it escalates at the full configured rate.
+        let max_priority_fee_per_gas =
     }
 }
 
