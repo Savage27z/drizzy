@@ -1437,6 +1437,7 @@ mod tests {
             fees: FeesConfig {
                 mode: crate::config::FeeMode::Automatic,
                 replacement_bump_bps: 11_250,
+                initial_multiplier_bps: 12_500,
             },
             rpc_url: "https://rpc.example.invalid".parse().expect("RPC URL"),
             gas_limit: 300_000,
