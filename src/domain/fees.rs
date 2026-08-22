@@ -2,6 +2,7 @@ use alloy_primitives::U256;
 use thiserror::Error;
 
 const BASIS_POINTS: u32 = 10_000;
+/// The protocol caps how fast the base fee itself can rise: at most 12.5%
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Eip1559Fees {
