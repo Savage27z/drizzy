@@ -36,7 +36,9 @@ use tokio::{
 use crate::{
     assistant, logging, manifest_crypto,
     multi_wallet::WalletManifest,
+    signing::WalletSigner,
     snipe::{self, SnipeOptions},
+    sponsored_snipe::{self, SponsoredSnipeOptions},
     sweep, wallet_generator,
 };
 
@@ -86,9 +88,20 @@ enum Step {
     Chain,
     Quantity,
     Wallets,
+    /// Only reached when the bot has a sponsor configured — self-funded is
+    /// otherwise the only option and this step is skipped entirely.
+    Funding,
     Gas,
     Early,
     Confirm,
+}
+
+/// Who pays gas: every wallet its own (unchanged default), or one sponsor
+/// wallet for the whole batch via EIP-7702 delegation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Funding {
+    SelfFunded,
+    Sponsored,
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +111,7 @@ struct Wizard {
     chain: Option<String>,
     quantity: u64,
     wallets: Option<Vec<usize>>,
+    funding: Funding,
     max_fee_per_gas: Option<U256>,
     max_priority_fee_per_gas: Option<U256>,
     early_fire_ms: u64,
@@ -111,11 +125,23 @@ impl Wizard {
             chain: None,
             quantity: 1,
             wallets: None,
+            funding: Funding::SelfFunded,
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             early_fire_ms: 0,
         }
     }
+}
+
+/// The operator's own gas-paying wallet and the executor it's wired to.
+/// Global, not per-chat — see the module doc comment on the trust model this
+/// assumes: every allowed chat can spend this wallet's gas.
+struct SponsorContext {
+    signer: WalletSigner,
+    executor: Address,
+    recipient: Address,
+    mint_gas_limit: u64,
+    operation_deadline_seconds: u64,
 }
 
 struct Bot {
@@ -131,10 +157,19 @@ struct Bot {
     /// plain message is that count.
     awaiting_wallet_count: Mutex<HashSet<i64>>,
     awaiting_recovery: Mutex<HashSet<i64>>,
+    /// `None` unless `SPONSOR_KEY`, `SPONSORED_EXECUTOR_ADDRESS`, and
+    /// `RECIPIENT_ADDRESS` are all configured — sponsored mode is simply not
+    /// offered in the wizard until then.
+    sponsor: Option<SponsorContext>,
 }
 
 impl Bot {
-    fn new(token: String, allowed: Vec<i64>, wallets_dir: PathBuf) -> Result<Self, BotError> {
+    fn new(
+        token: String,
+        allowed: Vec<i64>,
+        wallets_dir: PathBuf,
+        sponsor: Option<SponsorContext>,
+    ) -> Result<Self, BotError> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -148,6 +183,7 @@ impl Bot {
             active: Mutex::new(HashMap::new()),
             awaiting_wallet_count: Mutex::new(HashSet::new()),
             awaiting_recovery: Mutex::new(HashSet::new()),
+            sponsor,
         })
     }
 
@@ -287,6 +323,70 @@ impl Bot {
     }
 }
 
+/// `None` unless every required sponsor setting is present and valid.
+/// Deliberately non-fatal on a missing or bad setting — the bot still runs
+/// self-funded-only rather than refusing to start, since sponsored mode is
+/// additive. Mirrors the CLI's own `SPONSOR_KEY` / `SPONSORED_EXECUTOR_ADDRESS`
+/// / `SPONSORED_OPERATION_DEADLINE_SECONDS` semantics from `config.rs` so the
+/// same `.env` values work in both places.
+fn load_sponsor_context() -> Option<SponsorContext> {
+    let sponsor_key = env::var("SPONSOR_KEY").ok()?;
+    let signer = match WalletSigner::from_private_key(sponsor_key.trim()) {
+        Ok(signer) => signer,
+        Err(error) => {
+            logging::warn(format!("SPONSOR_KEY is set but invalid — sponsored mode disabled: {error}"));
+            return None;
+        }
+    };
+    let Ok(executor_raw) = env::var("SPONSORED_EXECUTOR_ADDRESS") else {
+        logging::warn(
+            "SPONSOR_KEY is set but SPONSORED_EXECUTOR_ADDRESS is not — sponsored mode disabled.",
+        );
+        return None;
+    };
+    let Ok(executor) = executor_raw.trim().parse::<Address>() else {
+        logging::warn("SPONSORED_EXECUTOR_ADDRESS is not a valid address — sponsored mode disabled.");
+        return None;
+    };
+    let Ok(recipient_raw) = env::var("RECIPIENT_ADDRESS") else {
+        logging::warn(
+            "SPONSOR_KEY is set but RECIPIENT_ADDRESS is not — sponsored mode disabled.",
+        );
+        return None;
+    };
+    let Ok(recipient) = recipient_raw.trim().parse::<Address>() else {
+        logging::warn("RECIPIENT_ADDRESS is not a valid address — sponsored mode disabled.");
+        return None;
+    };
+    if recipient == executor {
+        logging::warn(
+            "RECIPIENT_ADDRESS must differ from SPONSORED_EXECUTOR_ADDRESS — sponsored mode disabled.",
+        );
+        return None;
+    }
+    let mint_gas_limit = env::var("GAS_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(250_000);
+    let operation_deadline_seconds = env::var("SPONSORED_OPERATION_DEADLINE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(120);
+    if !(30..=3_600).contains(&operation_deadline_seconds) {
+        logging::warn(
+            "SPONSORED_OPERATION_DEADLINE_SECONDS must be 30-3600 — sponsored mode disabled.",
+        );
+        return None;
+    }
+    Some(SponsorContext {
+        signer,
+        executor,
+        recipient,
+        mint_gas_limit,
+        operation_deadline_seconds,
+    })
+}
+
 pub async fn run_bot() -> Result<(), BotError> {
     let _ = dotenvy::dotenv();
 
@@ -331,7 +431,12 @@ pub async fn run_bot() -> Result<(), BotError> {
 
     prepare_encryption_at_rest(&wallets_dir)?;
 
-    let bot = Arc::new(Bot::new(token, allowed, wallets_dir)?);
+    let sponsor = load_sponsor_context();
+    if sponsor.is_some() {
+        logging::info("Sponsored mode available — SPONSOR_KEY, SPONSORED_EXECUTOR_ADDRESS, and RECIPIENT_ADDRESS are all configured.");
+    }
+
+    let bot = Arc::new(Bot::new(token, allowed, wallets_dir, sponsor)?);
 
     let me = bot.api("getMe", json!({})).await?;
     let username = me.get("username").and_then(Value::as_str).unwrap_or("?");
@@ -999,6 +1104,7 @@ async fn handle_document(bot: &Arc<Bot>, chat_id: i64, message: &Value) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_callback(bot: &Arc<Bot>, chat_id: i64, data: &str) {
     match data {
         "menu:snipe" => {
@@ -1058,6 +1164,27 @@ async fn handle_callback(bot: &Arc<Bot>, chat_id: i64, data: &str) {
         if let Ok(count) = count.parse::<usize>() {
             create_wallets(bot, chat_id, count).await;
         }
+        return;
+    }
+    if let Some(mode) = data.strip_prefix("fund:") {
+        let mut wizards = bot.wizards.lock().await;
+        if let Some(wizard) = wizards.get_mut(&chat_id)
+            && wizard.step == Step::Funding
+        {
+            wizard.funding = if mode == "sponsor" {
+                Funding::Sponsored
+            } else {
+                Funding::SelfFunded
+            };
+            wizard.step = Step::Gas;
+        }
+        drop(wizards);
+        let _ = bot
+            .send(
+                chat_id,
+                "Gas: send `max/priority` in gwei (e.g. `0.05/0.01`) or `auto`.",
+            )
+            .await;
         return;
     }
     match data {
@@ -1144,23 +1271,45 @@ async fn advance_wizard(bot: &Arc<Bot>, chat_id: i64, text: &str) {
                 } else {
                     Some(selection)
                 };
-                wizard.step = Step::Gas;
-                *bot.wizards
-                    .lock()
-                    .await
-                    .get_mut(&chat_id)
-                    .expect("wizard exists") = wizard;
-                let _ = bot
-                    .send(
-                        chat_id,
-                        "Gas: send `max/priority` in gwei (e.g. `0.05/0.01`) or `auto`.",
-                    )
-                    .await;
+                if bot.sponsor.is_some() {
+                    wizard.step = Step::Funding;
+                    *bot.wizards
+                        .lock()
+                        .await
+                        .get_mut(&chat_id)
+                        .expect("wizard exists") = wizard;
+                    let _ = bot
+                        .send_keyboard(
+                            chat_id,
+                            "Who pays gas?",
+                            &[&[
+                                ("Self-funded (each wallet)", "fund:self"),
+                                ("Sponsored (one wallet, all gas)", "fund:sponsor"),
+                            ]],
+                        )
+                        .await;
+                } else {
+                    wizard.step = Step::Gas;
+                    *bot.wizards
+                        .lock()
+                        .await
+                        .get_mut(&chat_id)
+                        .expect("wizard exists") = wizard;
+                    let _ = bot
+                        .send(
+                            chat_id,
+                            "Gas: send `max/priority` in gwei (e.g. `0.05/0.01`) or `auto`.",
+                        )
+                        .await;
+                }
             }
             Err(message) => {
                 let _ = bot.send(chat_id, &message).await;
             }
         },
+        Step::Funding => {
+            let _ = bot.send(chat_id, "Use the buttons above.").await;
+        }
         Step::Gas => match parse_gas(text) {
             Ok((max, priority)) => {
                 wizard.max_fee_per_gas = max;
@@ -1346,7 +1495,50 @@ fn parse_gas(text: &str) -> Result<(Option<U256>, Option<U256>), String> {
     Ok((max, priority))
 }
 
+fn gas_label(wizard: &Wizard) -> String {
+    match (wizard.max_fee_per_gas, wizard.max_priority_fee_per_gas) {
+        (Some(max), Some(priority)) => format!(
+            "max {} / priority {} gwei",
+            format_gwei(max),
+            format_gwei(priority)
+        ),
+        (Some(max), None) => format!("max {} gwei / priority auto", format_gwei(max)),
+        (None, Some(priority)) => format!("max auto / priority {} gwei", format_gwei(priority)),
+        (None, None) => "auto (chain estimate)".to_owned(),
+    }
+}
+
+fn wallet_label(wizard: &Wizard, wallet_count: usize) -> String {
+    match &wizard.wallets {
+        Some(indices) if !indices.is_empty() => {
+            format!("{} wallet(s) — indices {:?}", indices.len(), indices)
+        }
+        _ => format!("{wallet_count} wallet(s) — all"),
+    }
+}
+
+fn stage_status(start_time: u64) -> &'static str {
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    )
+    .unwrap_or(i64::MAX);
+    if i64::try_from(start_time).unwrap_or(i64::MAX) <= now {
+        "Live"
+    } else {
+        "Scheduled"
+    }
+}
+
 async fn show_confirm(bot: &Arc<Bot>, chat_id: i64, wizard: &Wizard) {
+    match wizard.funding {
+        Funding::SelfFunded => show_confirm_self_funded(bot, chat_id, wizard).await,
+        Funding::Sponsored => show_confirm_sponsored(bot, chat_id, wizard).await,
+    }
+}
+
+async fn show_confirm_self_funded(bot: &Arc<Bot>, chat_id: i64, wizard: &Wizard) {
     let chain = wizard.chain.clone().unwrap_or_default();
     let options = SnipeOptions {
         collection: wizard.collection.clone(),
@@ -1367,48 +1559,23 @@ async fn show_confirm(bot: &Arc<Bot>, chat_id: i64, wizard: &Wizard) {
 
     match snipe::preview(&options).await {
         Ok(preview) => {
-            let now = i64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs()),
-            )
-            .unwrap_or(i64::MAX);
-            let stage_status = if i64::try_from(preview.start_time).unwrap_or(i64::MAX) <= now {
-                "Live"
-            } else {
-                "Scheduled"
-            };
-            let wallet_label = match &wizard.wallets {
-                Some(indices) if !indices.is_empty() => {
-                    format!("{} wallet(s) — indices {:?}", indices.len(), indices)
-                }
-                _ => format!("{} wallet(s) — all", preview.wallet_count),
-            };
-            let gas_label = match (wizard.max_fee_per_gas, wizard.max_priority_fee_per_gas) {
-                (Some(max), Some(priority)) => format!(
-                    "max {} / priority {} gwei",
-                    format_gwei(max),
-                    format_gwei(priority)
-                ),
-                (Some(max), None) => format!("max {} gwei / priority auto", format_gwei(max)),
-                (None, Some(priority)) => {
-                    format!("max auto / priority {} gwei", format_gwei(priority))
-                }
-                (None, None) => "auto (chain estimate)".to_owned(),
-            };
             let summary = format!(
-                "*Snipe Preview* — {stage_status}\n\n\
+                "*Snipe Preview* — {}\n\n\
                  Contract: `{}`\n\
                  Chain: {}\n\
                  Price: {} wei ({:.4} ETH)\n\
-                 Wallets: {wallet_label}\n\
-                 Gas: {gas_label}\n\
+                 Wallets: {}\n\
+                 Funding: self-funded (each wallet pays its own gas)\n\
+                 Gas: {}\n\
                  Early fire: {} ms\n\n\
                  Confirm?",
+                stage_status(preview.start_time),
                 preview.nft_contract,
                 preview.chain_name,
                 preview.price,
                 eth_from_wei(preview.price),
+                wallet_label(wizard, preview.wallet_count),
+                gas_label(wizard),
                 wizard.early_fire_ms,
             );
             let _ = bot
@@ -1431,7 +1598,103 @@ async fn show_confirm(bot: &Arc<Bot>, chat_id: i64, wizard: &Wizard) {
     }
 }
 
+async fn show_confirm_sponsored(bot: &Arc<Bot>, chat_id: i64, wizard: &Wizard) {
+    let Some(options) = sponsored_options(bot, chat_id, wizard, None) else {
+        bot.wizards.lock().await.remove(&chat_id);
+        let _ = bot
+            .send(
+                chat_id,
+                "Sponsored mode is no longer configured — send /snipe to try again.",
+            )
+            .await;
+        return;
+    };
+
+    match sponsored_snipe::preview(&options).await {
+        Ok(preview) => {
+            let summary = format!(
+                "*Sponsored Snipe Preview* — {}\n\n\
+                 Contract: `{}`\n\
+                 Chain: {}\n\
+                 Price: {} wei ({:.4} ETH)\n\
+                 Wallets: {}\n\
+                 Funding: sponsored — `{}` pays all gas\n\
+                 NFT recipient: `{}`\n\
+                 Gas: {}\n\
+                 Early fire: {} ms\n\n\
+                 Confirm?",
+                stage_status(preview.start_time),
+                preview.nft_contract,
+                preview.chain_name,
+                preview.price,
+                eth_from_wei(preview.price),
+                wallet_label(wizard, preview.wallet_count),
+                preview.sponsor,
+                preview.recipient,
+                gas_label(wizard),
+                wizard.early_fire_ms,
+            );
+            let _ = bot
+                .send_keyboard(
+                    chat_id,
+                    &summary,
+                    &[&[("FIRE", "fire:yes"), ("Cancel", "fire:no")]],
+                )
+                .await;
+        }
+        Err(error) => {
+            bot.wizards.lock().await.remove(&chat_id);
+            let _ = bot
+                .send(
+                    chat_id,
+                    &format!(
+                        "Cannot preview this sponsored snipe: {error}\n\nSend /snipe to try again."
+                    ),
+                )
+                .await;
+        }
+    }
+}
+
+/// Builds `SponsoredSnipeOptions` from the wizard + bot's sponsor config.
+/// `None` if sponsored mode isn't (or is no longer) configured — checked
+/// again here rather than trusting the wizard state, since the bot's env
+/// could theoretically change between steps in a long-lived process.
+fn sponsored_options(
+    bot: &Arc<Bot>,
+    chat_id: i64,
+    wizard: &Wizard,
+    notify: Option<mpsc::UnboundedSender<String>>,
+) -> Option<SponsoredSnipeOptions> {
+    let sponsor = bot.sponsor.as_ref()?;
+    Some(SponsoredSnipeOptions {
+        collection: wizard.collection.clone(),
+        quantity: Some(wizard.quantity),
+        wallets_file: bot.manifest_path(chat_id),
+        wallet_indices: wizard.wallets.clone(),
+        rpc_urls: env_rpc_urls(),
+        chain: wizard.chain.clone(),
+        sponsor: sponsor.signer.clone(),
+        executor: sponsor.executor,
+        recipient: sponsor.recipient,
+        mint_gas_limit: sponsor.mint_gas_limit,
+        operation_deadline_seconds: sponsor.operation_deadline_seconds,
+        max_fee_per_gas: wizard.max_fee_per_gas,
+        max_priority_fee_per_gas: wizard.max_priority_fee_per_gas,
+        early_fire_ms: wizard.early_fire_ms,
+        fire_now: false,
+        notify,
+    })
+}
+
 async fn fire_snipe(bot: &Arc<Bot>, chat_id: i64, wizard: Wizard) {
+    match wizard.funding {
+        Funding::SelfFunded => fire_snipe_self_funded(bot, chat_id, wizard).await,
+        Funding::Sponsored => fire_snipe_sponsored(bot, chat_id, wizard).await,
+    }
+}
+
+async fn fire_snipe_self_funded(bot: &Arc<Bot>, chat_id: i64, wizard: Wizard) {
     let Some(chain) = wizard.chain.clone() else {
         let _ = bot
             .send(chat_id, "No chain selected — send /snipe to start again.")
@@ -1478,6 +1741,55 @@ async fn fire_snipe(bot: &Arc<Bot>, chat_id: i64, wizard: Wizard) {
             )
             .await;
         let result = snipe::run_snipe(options).await;
+        if let Err(error) = result {
+            let _ = bot_clone.send(chat_id, &format!("Error: {error}")).await;
+        }
+        {
+            let mut active = bot_clone.active.lock().await;
+            if let Some(count) = active.get_mut(&chat_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    active.remove(&chat_id);
+                }
+            }
+        }
+        let _ = forwarder.await;
+    });
+}
+
+async fn fire_snipe_sponsored(bot: &Arc<Bot>, chat_id: i64, wizard: Wizard) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let Some(options) = sponsored_options(bot, chat_id, &wizard, Some(tx)) else {
+        let _ = bot
+            .send(
+                chat_id,
+                "Sponsored mode is no longer configured — send /snipe to try again.",
+            )
+            .await;
+        return;
+    };
+
+    {
+        let mut active = bot.active.lock().await;
+        *active.entry(chat_id).or_insert(0) += 1;
+    }
+
+    let bot_clone = bot.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            let _ = bot_clone.send(chat_id, &line).await;
+        }
+    });
+
+    let bot_clone = bot.clone();
+    tokio::spawn(async move {
+        let _ = bot_clone
+            .send(
+                chat_id,
+                "Arming sponsored snipe. Signing the batch — progress will stream here.",
+            )
+            .await;
+        let result = sponsored_snipe::run_sponsored_snipe(options).await;
         if let Err(error) = result {
             let _ = bot_clone.send(chat_id, &format!("Error: {error}")).await;
         }
@@ -1622,6 +1934,7 @@ mod tests {
             "token".to_owned(),
             vec![1, 2],
             PathBuf::from("/data/wallets"),
+            None,
         )
         .expect("client builds");
 
