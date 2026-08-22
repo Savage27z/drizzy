@@ -921,6 +921,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
                 // ground truth for this exact call right now, so once we have
                 // one, prefer it — padded for safety — over the guess, but
                 // only to raise the limit, never to shrink it below the
+                // configured floor.
             Err(_) if !stage_is_live => {
                 emit_info!(
                     "Simulation reverted, as expected before the stage opens — continuing to arm"
