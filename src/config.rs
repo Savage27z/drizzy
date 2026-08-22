@@ -499,6 +499,7 @@ impl AppConfig {
                 "REPLACEMENT_BUMP_BPS must be between 10001 and 20000".into(),
             ));
         }
+        if !(10_000..=50_000).contains(&self.fees.initial_multiplier_bps) {
             ));
         }
         match self.fees.mode {
