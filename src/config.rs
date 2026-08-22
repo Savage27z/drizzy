@@ -447,6 +447,7 @@ fn parse_fees(values: &mut BTreeMap<String, String>) -> Result<FeesConfig, Confi
     Ok(FeesConfig {
         mode,
         replacement_bump_bps,
+        initial_multiplier_bps,
     })
 }
 
