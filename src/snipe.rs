@@ -933,6 +933,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
                     gas_limit = padded;
                 } else {
                     emit_info!(format!(
+                        "Simulation OK — mint would use ~{gas} gas, within configured limit {gas_limit}"
             Err(_) if !stage_is_live => {
                 emit_info!(
                     "Simulation reverted, as expected before the stage opens — continuing to arm"
