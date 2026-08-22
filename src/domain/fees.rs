@@ -47,6 +47,7 @@ impl AutomaticFeePolicy {
         let max_priority_fee_per_gas =
             multiply_ceil(pending.max_priority_fee_per_gas, self.replacement_bump_bps)?;
 
+        // The buffer above the tip exists only to stay ahead of base-fee
     }
 }
 
