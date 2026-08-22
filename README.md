@@ -520,7 +520,7 @@ The chain ID is read from `RPC_URL`; the user does not configure a separate chai
 | `PENDING_TIMEOUT_SECONDS` | `20` | Time before a pending transaction becomes eligible for replacement; range `1-86400` |
 | `RECEIPT_POLL_BASE_DELAY_MS` | `250` | Initial receipt polling delay; range `50-60000` |
 | `RECEIPT_POLL_MAX_DELAY_MS` | `2000` | Maximum receipt polling delay; range `50-60000` and not below the initial delay |
-| `REPLACEMENT_BUMP_BPS` | `11250` | Replacement fee factor; range `10001-20000` basis points (`11250` means 112.5%) |
+| `REPLACEMENT_BUMP_BPS` | `11250` | Replacement fee factor; range `10001-20000` basis points (`11250` means 112.5%). Applies in full to `max_priority_fee_per_gas` on every retry; only applies to the `max_fee_per_gas` buffer up to the protocol's own ~12.5%/block base-fee growth cap, since headroom above that never gets spent |
 
 ### Scheduling and request settings
 
