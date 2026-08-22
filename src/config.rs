@@ -131,6 +131,7 @@ pub struct FeesConfig {
     /// attempt, in basis points (10_000 = no markup, 12_500 = the previous
     /// hardcoded +25%). Was a private constant with no way to tune it per
     /// chain or collection without recompiling; now it's `INITIAL_FEE_MULTIPLIER_BPS`.
+    pub initial_multiplier_bps: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
