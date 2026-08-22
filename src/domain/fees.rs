@@ -45,6 +45,7 @@ impl AutomaticFeePolicy {
         // The tip (max_priority_fee_per_gas) is what actually has to win the
         // inclusion race, so it escalates at the full configured rate.
         let max_priority_fee_per_gas =
+            multiply_ceil(pending.max_priority_fee_per_gas, self.replacement_bump_bps)?;
     }
 }
 
