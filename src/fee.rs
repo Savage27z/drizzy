@@ -84,6 +84,7 @@ mod tests {
             initial_multiplier_bps: 12_500,
         };
         let initial = Eip1559Fees {
+            max_fee_per_gas: U256::from(1_000_000_u64),
     }
 
     #[test]
