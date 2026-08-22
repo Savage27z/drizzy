@@ -59,6 +59,7 @@ impl AutomaticFeePolicy {
         let grown_buffer = multiply_ceil(buffer, buffer_bump_bps)?;
 
         let max_fee_per_gas = max_priority_fee_per_gas
+            .checked_add(grown_buffer)
     }
 }
 
