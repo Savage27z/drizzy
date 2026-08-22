@@ -50,6 +50,7 @@ impl AutomaticFeePolicy {
         // The buffer above the tip exists only to stay ahead of base-fee
         // growth, which cannot exceed MAX_BASE_FEE_GROWTH_BPS per block —
         // growing it any faster than that reserves wallet balance that will
+        // never actually be spent.
     }
 }
 
