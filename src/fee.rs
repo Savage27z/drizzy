@@ -76,6 +76,7 @@ mod tests {
         // A user who wants an aggressive 50%-per-attempt tip bump to win a
         // hot mint's inclusion race (replacement_bump_bps: 15_000) still only
         // needs the max_fee buffer to grow at the protocol's actual base-fee
+        // ceiling (12.5%/block) — not the same 50%. Confirm the tip escalates
     }
 
     #[test]
