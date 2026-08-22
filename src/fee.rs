@@ -90,6 +90,7 @@ mod tests {
         let policy = AutomaticFeePolicy::new(10_000, config.replacement_bump_bps)
             .expect("valid policy");
         let bumped = policy.replacement(initial).expect("replacement fees");
+
     }
 
     #[test]
