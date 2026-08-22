@@ -65,6 +65,7 @@ mod tests {
         // At the default 11_250 bps bump — exactly the protocol's own
         // per-block base-fee growth cap — the buffer cap never kicks in, so
         // this only differs from a flat "multiply everything" scheme by
+        // integer-rounding noise (161 vs. a flat-multiply's 159).
         let maximum = maximum_transaction_fees(config, 3, initial).expect("maximum fees");
         assert_eq!(maximum.max_fee_per_gas, U256::from(159_u64));
         assert_eq!(maximum.max_priority_fee_per_gas, U256::from(14_u64));
