@@ -62,6 +62,7 @@ impl AutomaticFeePolicy {
             .checked_add(grown_buffer)
             .ok_or(FeeError::Overflow)?;
         Ok(Eip1559Fees {
+            max_fee_per_gas,
     }
 }
 
