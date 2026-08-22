@@ -8,6 +8,7 @@ const BASIS_POINTS: u32 = 10_000;
 /// is never actually paid past `base_fee + priority_fee`, so escalating it at
 /// the same (often much higher, user-configured) rate used to win the tip
 /// race just inflates the wallet balance a wallet must reserve, for no real
+/// benefit. Capping the buffer's growth here keeps every replacement fully
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Eip1559Fees {
