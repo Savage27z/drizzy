@@ -96,6 +96,7 @@ mod tests {
         // Buffer (900_000) would grow to 1_350_000 under a flat 50% bump,
         // pushing max_fee to 1_500_000 — instead it's capped at the
         // protocol's real 12.5% base-fee ceiling.
+        let flat_bump_max_fee = U256::from(1_500_000_u64);
     }
 
     #[test]
