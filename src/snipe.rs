@@ -856,7 +856,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
         };
 
     emit_info!(format!(
-        "Gas: limit {gas_limit} | max fee {} gwei | priority {} gwei",
+        "Fees: max fee {} gwei | priority {} gwei",
         format_gwei(max_fee_per_gas),
         format_gwei(max_priority_fee_per_gas)
     ));
