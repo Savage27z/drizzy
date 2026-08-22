@@ -83,6 +83,7 @@ mod tests {
             replacement_bump_bps: 15_000,
             initial_multiplier_bps: 12_500,
         };
+        let initial = Eip1559Fees {
     }
 
     #[test]
