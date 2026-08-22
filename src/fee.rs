@@ -92,6 +92,7 @@ mod tests {
         let bumped = policy.replacement(initial).expect("replacement fees");
 
         // Tip escalates by the full configured 50%.
+        assert_eq!(bumped.max_priority_fee_per_gas, U256::from(150_000_u64));
     }
 
     #[test]
