@@ -52,6 +52,7 @@ impl AutomaticFeePolicy {
         // growing it any faster than that reserves wallet balance that will
         // never actually be spent.
         let buffer = pending
+            .max_fee_per_gas
     }
 }
 
