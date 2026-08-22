@@ -917,6 +917,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
         match simulation {
             Ok(gas) => {
                 // The static config value is a guess made before anyone knew
+                // real network conditions. A live eth_estimateGas result is
             Err(_) if !stage_is_live => {
                 emit_info!(
                     "Simulation reverted, as expected before the stage opens — continuing to arm"
