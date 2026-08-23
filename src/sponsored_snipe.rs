@@ -100,8 +100,11 @@ pub struct SponsoredSnipeOptions {
     /// Every minted NFT is forwarded here — the executor never leaves an NFT
     /// in the delegated wallet. Must differ from every minting wallet.
     pub recipient: Address,
-    /// Per-wallet mint gas headroom; the wallet's full execution envelope is
-    /// derived from this via `sponsored_wallet_gas_limit`.
+    /// Mint gas headroom for *one* unit — internally multiplied by each
+    /// wallet's quantity before being used, since minting N units also
+    /// forwards N units, each its own gas-costing transfer. The wallet's
+    /// full execution envelope is then derived from that per-wallet total
+    /// via `sponsored_wallet_gas_limit`.
     pub mint_gas_limit: u64,
     pub operation_deadline_seconds: u64,
     pub max_fee_per_gas: Option<U256>,
@@ -307,7 +310,20 @@ pub async fn run_sponsored_snipe(
             }
         }
 
-        let wallet_gas_limit = sponsored_wallet_gas_limit(options.mint_gas_limit)
+        // The executor's receiver-callback forwards every minted unit with
+        // its own separate safe-transfer call, all inside this one gas
+        // budget — minting 5 costs roughly 5 mints *and* 5 forwarding
+        // transfers, not 1 of each. A flat mint_gas_limit here (unscaled by
+        // quantity) starves any wallet minting more than ~1-2 units: the
+        // mint itself succeeds internally, but the last forward call runs
+        // out of gas, and the whole operation reverts with an
+        // indistinguishable empty-data MintCallFailed. Scale with quantity
+        // so the budget actually covers what gets executed.
+        let per_wallet_mint_gas_limit = options
+            .mint_gas_limit
+            .checked_mul((*quantity).max(1))
+            .ok_or(SponsoredMintError::InvalidGasLimits)?;
+        let wallet_gas_limit = sponsored_wallet_gas_limit(per_wallet_mint_gas_limit)
             .ok_or(SponsoredMintError::InvalidGasLimits)?;
         let operation = SponsoredMintOperation::unsigned(UnsignedSponsoredMintOperation {
             wallet: wallet_address,
@@ -316,7 +332,7 @@ pub async fn run_sponsored_snipe(
             recipient: options.recipient,
             mint_value,
             expected_units: U256::from(*quantity),
-            mint_gas_limit: options.mint_gas_limit,
+            mint_gas_limit: per_wallet_mint_gas_limit,
             wallet_gas_limit,
             deadline,
             mint_calldata: seadrop::encode_mint_public(nft_contract, base.fee_recipient, *quantity),
