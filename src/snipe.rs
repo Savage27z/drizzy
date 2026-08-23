@@ -306,16 +306,29 @@ pub(crate) async fn resolve_nft_contract(
                 return Ok(address);
             }
         }
-        let slug = url
-            .path_segments()
-            .into_iter()
-            .flatten()
-            .last()
-            .unwrap_or_default()
-            .to_owned();
-        return resolve_slug(&slug, client).await;
+        return resolve_slug(&collection_slug_from_url(&url), client).await;
     }
     resolve_slug(trimmed, client).await
+}
+
+/// A bare slug URL (`/collection/<slug>`) ends in the slug, so taking the
+/// last path segment used to be correct — but `OpenSea`'s UI routes carry a
+/// trailing tab (`/collection/<slug>/overview`, `/activity`, `/analytics`,
+/// ...), and taking the last segment there silently resolves a *different*,
+/// unrelated collection that happens to share that tab's name (there is a
+/// real `OpenSea` collection literally called "Overview"). The slug is always
+/// the segment right after the `collection` path component; fall back to the
+/// last segment only for a URL shape without one.
+fn collection_slug_from_url(url: &Url) -> String {
+    let segments: Vec<&str> = url.path_segments().into_iter().flatten().collect();
+    segments
+        .iter()
+        .position(|&segment| segment == "collection")
+        .and_then(|index| segments.get(index + 1))
+        .copied()
+        .or_else(|| segments.last().copied())
+        .unwrap_or_default()
+        .to_owned()
 }
 
 async fn resolve_slug(slug: &str, client: &reqwest::Client) -> Result<Address, SnipeError> {
@@ -1196,6 +1209,37 @@ mod tests {
         assert!(parse_gwei("1.0000000000").is_err());
         assert!(parse_gwei("abc").is_err());
         assert!(parse_gwei("").is_err());
+    }
+
+    #[test]
+    fn collection_slug_survives_opensea_tab_suffixes() {
+        let cases = [
+            (
+                "https://opensea.io/collection/do-not-mint-256500739/overview",
+                "do-not-mint-256500739",
+            ),
+            (
+                "https://opensea.io/collection/do-not-mint-256500739/activity",
+                "do-not-mint-256500739",
+            ),
+            (
+                "https://opensea.io/collection/do-not-mint-256500739/analytics",
+                "do-not-mint-256500739",
+            ),
+            // Bare slug URL, no trailing tab — still the last segment.
+            (
+                "https://opensea.io/collection/do-not-mint-256500739",
+                "do-not-mint-256500739",
+            ),
+        ];
+        for (url, expected) in cases {
+            let parsed = Url::parse(url).expect("valid URL");
+            assert_eq!(
+                collection_slug_from_url(&parsed),
+                expected,
+                "failed for {url}"
+            );
+        }
     }
 
     #[test]
