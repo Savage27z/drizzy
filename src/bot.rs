@@ -87,12 +87,9 @@ enum Step {
     Collection,
     Chain,
     Quantity,
-    Wallets,
     /// Only reached when the bot has a sponsor configured — self-funded is
     /// otherwise the only option and this step is skipped entirely.
     Funding,
-    Gas,
-    Early,
     Confirm,
 }
 
@@ -1168,7 +1165,7 @@ async fn handle_callback(bot: &Arc<Bot>, chat_id: i64, data: &str) {
     }
     if let Some(mode) = data.strip_prefix("fund:") {
         let mut wizards = bot.wizards.lock().await;
-        if let Some(wizard) = wizards.get_mut(&chat_id)
+        let updated = if let Some(wizard) = wizards.get_mut(&chat_id)
             && wizard.step == Step::Funding
         {
             wizard.funding = if mode == "sponsor" {
@@ -1176,15 +1173,15 @@ async fn handle_callback(bot: &Arc<Bot>, chat_id: i64, data: &str) {
             } else {
                 Funding::SelfFunded
             };
-            wizard.step = Step::Gas;
-        }
+            wizard.step = Step::Confirm;
+            Some(wizard.clone())
+        } else {
+            None
+        };
         drop(wizards);
-        let _ = bot
-            .send(
-                chat_id,
-                "Gas: send `max/priority` in gwei (e.g. `0.05/0.01`) or `auto`.",
-            )
-            .await;
+        if let Some(wizard) = updated {
+            show_confirm(bot, chat_id, &wizard).await;
+        }
         return;
     }
     match data {
@@ -1242,35 +1239,13 @@ async fn advance_wizard(bot: &Arc<Bot>, chat_id: i64, text: &str) {
                 )
                 .await;
         }
+        // Quantity is the last question with a free answer — wallets (all),
+        // gas (auto), and early-fire (0) are fixed defaults now rather than
+        // separate prompts, so a snipe only ever asks collection, chain,
+        // quantity, and (when configured) funding mode before confirm.
         Step::Quantity => match text.parse::<u64>() {
             Ok(quantity) if quantity > 0 => {
                 wizard.quantity = quantity;
-                wizard.step = Step::Wallets;
-                *bot.wizards
-                    .lock()
-                    .await
-                    .get_mut(&chat_id)
-                    .expect("wizard exists") = wizard;
-                let _ = bot
-                    .send(
-                        chat_id,
-                        "Which wallets? Send indices from /wallets (e.g. `0,1,2`) or `all`.",
-                    )
-                    .await;
-            }
-            _ => {
-                let _ = bot
-                    .send(chat_id, "Send a positive integer for quantity.")
-                    .await;
-            }
-        },
-        Step::Wallets => match parse_wallet_selection(text) {
-            Ok(selection) => {
-                wizard.wallets = if selection.is_empty() {
-                    None
-                } else {
-                    Some(selection)
-                };
                 if bot.sponsor.is_some() {
                     wizard.step = Step::Funding;
                     *bot.wizards
@@ -1289,65 +1264,24 @@ async fn advance_wizard(bot: &Arc<Bot>, chat_id: i64, text: &str) {
                         )
                         .await;
                 } else {
-                    wizard.step = Step::Gas;
+                    wizard.step = Step::Confirm;
                     *bot.wizards
                         .lock()
                         .await
                         .get_mut(&chat_id)
-                        .expect("wizard exists") = wizard;
-                    let _ = bot
-                        .send(
-                            chat_id,
-                            "Gas: send `max/priority` in gwei (e.g. `0.05/0.01`) or `auto`.",
-                        )
-                        .await;
+                        .expect("wizard exists") = wizard.clone();
+                    show_confirm(bot, chat_id, &wizard).await;
                 }
             }
-            Err(message) => {
-                let _ = bot.send(chat_id, &message).await;
+            _ => {
+                let _ = bot
+                    .send(chat_id, "Send a positive integer for quantity.")
+                    .await;
             }
         },
         Step::Funding => {
             let _ = bot.send(chat_id, "Use the buttons above.").await;
         }
-        Step::Gas => match parse_gas(text) {
-            Ok((max, priority)) => {
-                wizard.max_fee_per_gas = max;
-                wizard.max_priority_fee_per_gas = priority;
-                wizard.step = Step::Early;
-                *bot.wizards
-                    .lock()
-                    .await
-                    .get_mut(&chat_id)
-                    .expect("wizard exists") = wizard;
-                let _ = bot
-                    .send(
-                        chat_id,
-                        "Early fire (ms before stage open)? Send a number or `0`.",
-                    )
-                    .await;
-            }
-            Err(message) => {
-                let _ = bot.send(chat_id, &message).await;
-            }
-        },
-        Step::Early => match text.parse::<u64>() {
-            Ok(early) => {
-                wizard.early_fire_ms = early;
-                wizard.step = Step::Confirm;
-                *bot.wizards
-                    .lock()
-                    .await
-                    .get_mut(&chat_id)
-                    .expect("wizard exists") = wizard.clone();
-                show_confirm(bot, chat_id, &wizard).await;
-            }
-            _ => {
-                let _ = bot
-                    .send(chat_id, "Send a number of milliseconds or `0`.")
-                    .await;
-            }
-        },
         Step::Confirm => {
             let _ = bot
                 .send(
@@ -1438,62 +1372,6 @@ async fn start_from_locator(bot: &Arc<Bot>, chat_id: i64, locator: &str) {
     }
 }
 
-fn parse_wallet_selection(text: &str) -> Result<Vec<usize>, String> {
-    let trimmed = text.trim().to_ascii_lowercase();
-    if trimmed == "all" {
-        return Ok(Vec::new());
-    }
-    let mut indices = Vec::new();
-    for part in trimmed.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Ok(index) = part.parse::<usize>() {
-            if !indices.contains(&index) {
-                indices.push(index);
-            }
-        } else {
-            return Err(format!(
-                "Cannot parse `{part}` — send comma-separated indices or `all`."
-            ));
-        }
-    }
-    if indices.is_empty() {
-        return Err("Send at least one wallet index or `all`.".to_owned());
-    }
-    Ok(indices)
-}
-
-fn parse_gas(text: &str) -> Result<(Option<U256>, Option<U256>), String> {
-    let trimmed = text.trim().to_ascii_lowercase();
-    if trimmed == "auto" || trimmed.is_empty() {
-        return Ok((None, None));
-    }
-    let (max, priority) = match trimmed.split_once('/') {
-        Some((max, priority)) => (max.trim(), priority.trim()),
-        None => (trimmed.as_str(), ""),
-    };
-    let max = if max.is_empty() {
-        None
-    } else {
-        Some(
-            snipe::parse_gwei(max)
-                .map_err(|_| format!("Invalid max fee `{max}` — e.g. `0.05/0.01` or `auto`."))?,
-        )
-    };
-    let priority = if priority.is_empty() {
-        None
-    } else {
-        Some(snipe::parse_gwei(priority).map_err(|_| {
-            format!("Invalid priority fee `{priority}` — e.g. `0.05/0.01` or `auto`.")
-        })?)
-    };
-    if max.is_none() && priority.is_none() {
-        return Err("Send `max/priority` in gwei or `auto`.".to_owned());
-    }
-    Ok((max, priority))
-}
 
 fn gas_label(wizard: &Wizard) -> String {
     match (wizard.max_fee_per_gas, wizard.max_priority_fee_per_gas) {
@@ -1895,36 +1773,6 @@ fn eth_from_wei(wei: U256) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wallet_selection_parses_indices() {
-        assert_eq!(parse_wallet_selection("0,1,2").unwrap(), vec![0, 1, 2]);
-        assert_eq!(parse_wallet_selection("all").unwrap(), Vec::<usize>::new());
-        assert_eq!(parse_wallet_selection(" 2 , 0 , 2 ").unwrap(), vec![2, 0]);
-        assert!(parse_wallet_selection("x").is_err());
-        assert!(parse_wallet_selection("").is_err());
-    }
-
-    #[test]
-    fn gas_parses_forms() {
-        assert_eq!(parse_gas("auto").unwrap(), (None, None));
-        assert_eq!(
-            parse_gas("0.05/0.01").unwrap(),
-            (
-                Some(U256::from(50_000_000u128)),
-                Some(U256::from(10_000_000u128))
-            )
-        );
-        assert_eq!(
-            parse_gas("0.05").unwrap(),
-            (Some(U256::from(50_000_000u128)), None)
-        );
-        assert_eq!(
-            parse_gas("/0.01").unwrap(),
-            (None, Some(U256::from(10_000_000u128)))
-        );
-        assert!(parse_gas("nope").is_err());
-    }
 
     /// The core multi-tenant invariant: two chats must never resolve to the
     /// same manifest, or one user can spend another's wallets.
