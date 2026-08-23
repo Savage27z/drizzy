@@ -118,6 +118,19 @@ fn write_manifest(
     output: &Path,
     wallets: Vec<GeneratedWallet>,
 ) -> Result<(), WalletGeneratorError> {
+    write_manifest_at(output, wallets, false)
+}
+
+/// `overwrite` is only ever `true` for `expand_wallet_manifest`, where the
+/// caller has already verified the phrase reproduces every wallet the
+/// existing manifest holds before this replaces it — see the prefix check in
+/// that function's doc comment. Every other caller keeps the default
+/// create-only behavior, so a manifest is never silently replaced.
+fn write_manifest_at(
+    output: &Path,
+    wallets: Vec<GeneratedWallet>,
+    overwrite: bool,
+) -> Result<(), WalletGeneratorError> {
     let manifest = GeneratedManifest {
         version: MANIFEST_VERSION,
         wallets,
@@ -138,7 +151,11 @@ fn write_manifest(
     );
 
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    if overwrite {
+        options.write(true).create(true).truncate(true);
+    } else {
+        options.write(true).create_new(true);
+    }
     set_private_file_permissions(&mut options);
     let mut file = options.open(output).map_err(|source| {
         if source.kind() == io::ErrorKind::AlreadyExists {
@@ -204,6 +221,46 @@ pub fn recover_wallet_manifest(
     let seed = seed_from_mnemonic(&mnemonic);
     let (addresses, wallets) = derive_wallets_from_seed(&seed, count, quantity)?;
     write_manifest(output, wallets)?;
+
+    Ok(GeneratedWalletManifest {
+        path: output.to_path_buf(),
+        addresses,
+        quantity,
+        mnemonic: mnemonic_phrase,
+    })
+}
+
+/// Grow an existing manifest to `count` wallets by re-deriving from the same
+/// phrase that produced it and overwriting the file. Every existing wallet's
+/// key is unchanged — HD derivation gives wallet `i` the same key regardless
+/// of `count`, so this only ever *adds* wallets at the end, never touches the
+/// ones already funded.
+///
+/// The caller is responsible for verifying the phrase actually reproduces the
+/// wallets already on disk (e.g. via `addresses_from_mnemonic` against the
+/// manifest's current addresses) before calling this — this function itself
+/// has no way to check that and will happily overwrite with an unrelated
+/// phrase's wallets if asked to.
+pub fn expand_wallet_manifest(
+    output: &Path,
+    phrase: &str,
+    count: usize,
+    quantity: u64,
+) -> Result<GeneratedWalletManifest, WalletGeneratorError> {
+    if count == 0 || quantity == 0 {
+        return Err(WalletGeneratorError::InvalidAmount);
+    }
+    if count > MAX_MANIFEST_BYTES / MINIMUM_GENERATED_ENTRY_BYTES {
+        return Err(WalletGeneratorError::TooManyWallets);
+    }
+
+    let mnemonic: Mnemonic = phrase
+        .parse()
+        .map_err(|_| WalletGeneratorError::InvalidMnemonic)?;
+    let mnemonic_phrase = Zeroizing::new(mnemonic.to_string());
+    let seed = seed_from_mnemonic(&mnemonic);
+    let (addresses, wallets) = derive_wallets_from_seed(&seed, count, quantity)?;
+    write_manifest_at(output, wallets, true)?;
 
     Ok(GeneratedWalletManifest {
         path: output.to_path_buf(),
@@ -349,6 +406,34 @@ mod tests {
         let recovered =
             recover_wallet_manifest(&recovered_path, &phrase, 3, 1).expect("recovered manifest");
         assert_eq!(&generated.addresses()[..3], recovered.addresses());
+    }
+
+    #[test]
+    fn expand_grows_a_manifest_in_place_without_changing_existing_wallets() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("wallets.json");
+        let generated = create_wallet_manifest(&path, 3, 1).expect("generated manifest");
+        let phrase = generated.mnemonic().to_owned();
+
+        let expanded = expand_wallet_manifest(&path, &phrase, 10, 1).expect("expanded manifest");
+        assert_eq!(expanded.addresses().len(), 10);
+        assert_eq!(&expanded.addresses()[..3], generated.addresses());
+
+        let reloaded = crate::multi_wallet::WalletManifest::load(&path).expect("reloaded manifest");
+        assert_eq!(reloaded.len(), 10);
+    }
+
+    #[test]
+    fn expand_refuses_to_shrink_past_the_manifest_limit() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("wallets.json");
+        let generated = create_wallet_manifest(&path, 3, 1).expect("generated manifest");
+        let phrase = generated.mnemonic().to_owned();
+
+        assert!(matches!(
+            expand_wallet_manifest(&path, &phrase, 0, 1),
+            Err(WalletGeneratorError::InvalidAmount)
+        ));
     }
 
     #[test]

@@ -154,6 +154,11 @@ struct Bot {
     /// plain message is that count.
     awaiting_wallet_count: Mutex<HashSet<i64>>,
     awaiting_recovery: Mutex<HashSet<i64>>,
+    /// Chats mid-"add more wallets": the target *total* wallet count they
+    /// picked, waiting on their recovery phrase next. The phrase is verified
+    /// against the existing manifest's addresses before anything is
+    /// overwritten — see `handle_wallet_expansion_phrase`.
+    awaiting_wallet_expansion: Mutex<HashMap<i64, usize>>,
     /// `None` unless `SPONSOR_KEY`, `SPONSORED_EXECUTOR_ADDRESS`, and
     /// `RECIPIENT_ADDRESS` are all configured — sponsored mode is simply not
     /// offered in the wizard until then.
@@ -180,6 +185,7 @@ impl Bot {
             active: Mutex::new(HashMap::new()),
             awaiting_wallet_count: Mutex::new(HashSet::new()),
             awaiting_recovery: Mutex::new(HashSet::new()),
+            awaiting_wallet_expansion: Mutex::new(HashMap::new()),
             sponsor,
         })
     }
@@ -331,7 +337,9 @@ fn load_sponsor_context() -> Option<SponsorContext> {
     let signer = match WalletSigner::from_private_key(sponsor_key.trim()) {
         Ok(signer) => signer,
         Err(error) => {
-            logging::warn(format!("SPONSOR_KEY is set but invalid — sponsored mode disabled: {error}"));
+            logging::warn(format!(
+                "SPONSOR_KEY is set but invalid — sponsored mode disabled: {error}"
+            ));
             return None;
         }
     };
@@ -342,13 +350,13 @@ fn load_sponsor_context() -> Option<SponsorContext> {
         return None;
     };
     let Ok(executor) = executor_raw.trim().parse::<Address>() else {
-        logging::warn("SPONSORED_EXECUTOR_ADDRESS is not a valid address — sponsored mode disabled.");
+        logging::warn(
+            "SPONSORED_EXECUTOR_ADDRESS is not a valid address — sponsored mode disabled.",
+        );
         return None;
     };
     let Ok(recipient_raw) = env::var("RECIPIENT_ADDRESS") else {
-        logging::warn(
-            "SPONSOR_KEY is set but RECIPIENT_ADDRESS is not — sponsored mode disabled.",
-        );
+        logging::warn("SPONSOR_KEY is set but RECIPIENT_ADDRESS is not — sponsored mode disabled.");
         return None;
     };
     let Ok(recipient) = recipient_raw.trim().parse::<Address>() else {
@@ -430,7 +438,9 @@ pub async fn run_bot() -> Result<(), BotError> {
 
     let sponsor = load_sponsor_context();
     if sponsor.is_some() {
-        logging::info("Sponsored mode available — SPONSOR_KEY, SPONSORED_EXECUTOR_ADDRESS, and RECIPIENT_ADDRESS are all configured.");
+        logging::info(
+            "Sponsored mode available — SPONSOR_KEY, SPONSORED_EXECUTOR_ADDRESS, and RECIPIENT_ADDRESS are all configured.",
+        );
     }
 
     let bot = Arc::new(Bot::new(token, allowed, wallets_dir, sponsor)?);
@@ -586,16 +596,12 @@ async fn handle_text(bot: &Arc<Bot>, chat_id: i64, text: &str) {
             "cancel" => {
                 bot.wizards.lock().await.remove(&chat_id);
                 bot.awaiting_recovery.lock().await.remove(&chat_id);
+                bot.awaiting_wallet_expansion.lock().await.remove(&chat_id);
                 let _ = bot.send(chat_id, "Wizard cancelled.").await;
             }
             "status" => {
                 let active = bot.active.lock().await.get(&chat_id).copied().unwrap_or(0);
-                let _ = bot
-                    .send(
-                        chat_id,
-                        &format!("Active snipes: {active}"),
-                    )
-                    .await;
+                let _ = bot.send(chat_id, &format!("Active snipes: {active}")).await;
             }
             _ => {
                 let _ = bot.send(chat_id, "Unknown command — /help").await;
@@ -606,6 +612,16 @@ async fn handle_text(bot: &Arc<Bot>, chat_id: i64, text: &str) {
 
     if bot.awaiting_recovery.lock().await.contains(&chat_id) {
         handle_recovery_phrase(bot, chat_id, trimmed).await;
+        return;
+    }
+
+    if bot
+        .awaiting_wallet_expansion
+        .lock()
+        .await
+        .contains_key(&chat_id)
+    {
+        handle_wallet_expansion_phrase(bot, chat_id, trimmed).await;
         return;
     }
 
@@ -697,9 +713,7 @@ async fn handle_natural_language(bot: &Arc<Bot>, chat_id: i64, text: &str) {
 
     wizard.step = Step::Confirm;
     bot.wizards.lock().await.insert(chat_id, wizard.clone());
-    let _ = bot
-        .send(chat_id, &proposal.interpretation)
-        .await;
+    let _ = bot.send(chat_id, &proposal.interpretation).await;
     show_confirm(bot, chat_id, &wizard).await;
 }
 
@@ -776,6 +790,7 @@ async fn send_main_menu(bot: &Arc<Bot>, chat_id: i64) {
             ),
             &[
                 &[("Snipe", "menu:snipe"), ("Wallets", "menu:wallets")],
+                &[("+ Add Wallets", "menu:addwallets")],
                 &[("Withdraw", "menu:withdraw"), ("Status", "menu:status")],
                 &[("Help", "menu:help")],
             ],
@@ -888,8 +903,7 @@ async fn handle_recovery_phrase(bot: &Arc<Bot>, chat_id: i64, text: &str) {
 
     match wallet_generator::recover_wallet_manifest(&path, &phrase, count, 1) {
         Ok(manifest) => {
-            let mut lines =
-                format!("*{count} wallet(s) recovered.*\n\n");
+            let mut lines = format!("*{count} wallet(s) recovered.*\n\n");
             for (index, address) in manifest.addresses().iter().enumerate() {
                 let _ = writeln!(lines, "`{index}` — `{address}`");
             }
@@ -909,6 +923,186 @@ async fn handle_recovery_phrase(bot: &Arc<Bot>, chat_id: i64, text: &str) {
         Err(error) => {
             let _ = bot
                 .send(chat_id, &format!("Recovery failed: {error}"))
+                .await;
+        }
+    }
+}
+
+/// "+ Add Wallets" entry point: offer a few target totals above the current
+/// count, computed from the existing manifest so the buttons are always
+/// "more than you have now" rather than a fixed list that might be smaller.
+async fn start_add_wallets(bot: &Arc<Bot>, chat_id: i64) {
+    let Ok(manifest) = crate::multi_wallet::WalletManifest::load(&bot.manifest_path(chat_id))
+    else {
+        let _ = bot
+            .send(chat_id, "You have no wallets yet — /start to create some.")
+            .await;
+        return;
+    };
+    let current = manifest.len();
+    if current >= MAX_WALLETS_PER_USER {
+        let _ = bot
+            .send(
+                chat_id,
+                &format!("You're already at the {MAX_WALLETS_PER_USER}-wallet limit."),
+            )
+            .await;
+        return;
+    }
+
+    let targets = [current + 2, current + 5, current + 10];
+    let buttons: Vec<(String, String)> = targets
+        .into_iter()
+        .filter(|&target| target <= MAX_WALLETS_PER_USER)
+        .map(|target| (format!("{target} total"), format!("addwallets:{target}")))
+        .collect();
+    let row: Vec<(&str, &str)> = buttons
+        .iter()
+        .map(|(label, data)| (label.as_str(), data.as_str()))
+        .collect();
+    let _ = bot
+        .send_keyboard(
+            chat_id,
+            &format!(
+                "You have {current} wallet(s). Grow to how many total? \
+                 (existing wallets and their keys are never changed)"
+            ),
+            &[&row],
+        )
+        .await;
+}
+
+/// User picked a target total — now we need the recovery phrase before we
+/// can derive the new wallets and safely overwrite the manifest.
+async fn begin_wallet_expansion(bot: &Arc<Bot>, chat_id: i64, target: usize) {
+    let Ok(manifest) = crate::multi_wallet::WalletManifest::load(&bot.manifest_path(chat_id))
+    else {
+        let _ = bot
+            .send(chat_id, "You have no wallets yet — /start to create some.")
+            .await;
+        return;
+    };
+    let current = manifest.len();
+    if target <= current || target > MAX_WALLETS_PER_USER {
+        let _ = bot
+            .send(
+                chat_id,
+                &format!(
+                    "Target must be more than your current {current} and at most {MAX_WALLETS_PER_USER}."
+                ),
+            )
+            .await;
+        return;
+    }
+    bot.awaiting_wallet_expansion
+        .lock()
+        .await
+        .insert(chat_id, target);
+    let _ = bot
+        .send(
+            chat_id,
+            "Send the 12-word recovery phrase you were shown when these wallets were created.\n\n\
+             It's checked against your existing wallets first — nothing is touched if it doesn't match.\n\n\
+             /cancel to abort.",
+        )
+        .await;
+}
+
+/// Verifies the phrase actually reproduces the existing wallets before
+/// calling `expand_wallet_manifest`, which has no way to check that itself
+/// and would otherwise happily overwrite the manifest with an unrelated
+/// phrase's wallets.
+async fn handle_wallet_expansion_phrase(bot: &Arc<Bot>, chat_id: i64, text: &str) {
+    let Some(target) = bot.awaiting_wallet_expansion.lock().await.remove(&chat_id) else {
+        return;
+    };
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if !matches!(words.len(), 12 | 15 | 18 | 21 | 24) {
+        let _ = bot
+            .send(
+                chat_id,
+                &format!(
+                    "Expected 12 or 24 words, got {}. Send your full recovery phrase separated by spaces, or /cancel.",
+                    words.len()
+                ),
+            )
+            .await;
+        bot.awaiting_wallet_expansion
+            .lock()
+            .await
+            .insert(chat_id, target);
+        return;
+    }
+    let phrase = words.join(" ");
+
+    let path = bot.manifest_path(chat_id);
+    let existing = match crate::multi_wallet::WalletManifest::load(&path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let _ = bot
+                .send(
+                    chat_id,
+                    &format!("Cannot read your current wallets: {error}"),
+                )
+                .await;
+            return;
+        }
+    };
+    let current_addresses: Vec<_> = existing
+        .wallets()
+        .iter()
+        .map(crate::multi_wallet::WalletEntry::address)
+        .collect();
+
+    match wallet_generator::addresses_from_mnemonic(&phrase, current_addresses.len()) {
+        Ok(derived) if derived == current_addresses => {}
+        Ok(_) => {
+            let _ = bot
+                .send(
+                    chat_id,
+                    "That phrase doesn't match your existing wallets — refusing to overwrite. \
+                     Double-check the words, or /cancel.",
+                )
+                .await;
+            return;
+        }
+        Err(wallet_generator::WalletGeneratorError::InvalidMnemonic) => {
+            let _ = bot
+                .send(
+                    chat_id,
+                    "Invalid recovery phrase. Check spelling — every word must be from the BIP-39 English word list.",
+                )
+                .await;
+            return;
+        }
+        Err(error) => {
+            let _ = bot
+                .send(chat_id, &format!("Verification failed: {error}"))
+                .await;
+            return;
+        }
+    }
+
+    match wallet_generator::expand_wallet_manifest(&path, &phrase, target, 1) {
+        Ok(manifest) => {
+            let mut lines = format!(
+                "*Grown to {target} wallet(s).* Existing wallets are unchanged; new ones:\n\n"
+            );
+            for (index, address) in manifest
+                .addresses()
+                .iter()
+                .enumerate()
+                .skip(current_addresses.len())
+            {
+                let _ = writeln!(lines, "`{index}` — `{address}`");
+            }
+            lines.push_str("\nUse /wallets to see the full list.");
+            let _ = bot.send(chat_id, &lines).await;
+        }
+        Err(error) => {
+            let _ = bot
+                .send(chat_id, &format!("Could not grow the manifest: {error}"))
                 .await;
         }
     }
@@ -1041,9 +1235,7 @@ async fn handle_document(bot: &Arc<Bot>, chat_id: i64, message: &Value) {
         }
     };
     let Some(file_path) = file.get("file_path").and_then(Value::as_str) else {
-        let _ = bot
-            .send(chat_id, "Telegram returned no file path.")
-            .await;
+        let _ = bot.send(chat_id, "Telegram returned no file path.").await;
         return;
     };
     // Import into the caller's own manifest, and never over funded wallets —
@@ -1073,10 +1265,7 @@ async fn handle_document(bot: &Arc<Bot>, chat_id: i64, message: &Value) {
         && let Err(error) = manifest_crypto::write_manifest(&destination, &plaintext)
     {
         let _ = bot
-            .send(
-                chat_id,
-                &format!("Could not encrypt the import: {error}"),
-            )
+            .send(chat_id, &format!("Could not encrypt the import: {error}"))
             .await;
         return;
     }
@@ -1128,9 +1317,7 @@ async fn handle_callback(bot: &Arc<Bot>, chat_id: i64, data: &str) {
         }
         "menu:status" => {
             let active = bot.active.lock().await.get(&chat_id).copied().unwrap_or(0);
-            let _ = bot
-                .send(chat_id, &format!("Active snipes: {active}"))
-                .await;
+            let _ = bot.send(chat_id, &format!("Active snipes: {active}")).await;
             return;
         }
         "menu:help" => {
@@ -1141,7 +1328,17 @@ async fn handle_callback(bot: &Arc<Bot>, chat_id: i64, data: &str) {
             start_recovery(bot, chat_id).await;
             return;
         }
+        "menu:addwallets" => {
+            start_add_wallets(bot, chat_id).await;
+            return;
+        }
         _ => {}
+    }
+    if let Some(count) = data.strip_prefix("addwallets:") {
+        if let Ok(count) = count.parse::<usize>() {
+            begin_wallet_expansion(bot, chat_id, count).await;
+        }
+        return;
     }
     if let Some(chain) = data.strip_prefix("chain:") {
         let mut wizards = bot.wizards.lock().await;
@@ -1371,7 +1568,6 @@ async fn start_from_locator(bot: &Arc<Bot>, chat_id: i64, locator: &str) {
             .await;
     }
 }
-
 
 fn gas_label(wizard: &Wizard) -> String {
     match (wizard.max_fee_per_gas, wizard.max_priority_fee_per_gas) {

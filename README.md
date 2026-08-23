@@ -486,6 +486,7 @@ Configuration (`.env`):
 Commands:
 
 - `/wallets` — list manifest wallets (addresses only, never keys)
+- **"+ Add Wallets"** (main menu button) — grow an existing manifest by re-deriving from the same 12-word phrase at a larger count. Existing wallets and their keys never change; the phrase is checked against the current wallets before anything is overwritten, so a wrong phrase is refused rather than silently replacing funded wallets
 - `/snipe` — wizard: collection → chain → quantity → **funding mode** (only asked when sponsored mode is configured) → confirm. Wallets, gas, and early-fire aren't asked — they always default to all wallets, automatic gas, and no early fire. Wallet count and early-fire can still be overridden through the natural-language path (below); gas is always automatic in the bot
 - `/cancel`, `/status`, `/help`
 - **Upload a `wallets.json` file** — imports it as the server-side manifest; keys never appear in chat
