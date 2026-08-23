@@ -285,14 +285,19 @@ fn format_gwei(wei: U256) -> String {
 /// Resolve a collection locator (address, URL, or slug) to a contract address.
 /// Slug lookups hit `OpenSea`'s public v2 collections endpoint; the key is
 /// optional and only used when `OPENSEA_API_KEY` is set.
-pub(crate) async fn resolve_nft_contract(
+/// Resolves a collection locator to its contract address, plus a
+/// human-readable name when one is available. A bare address or an
+/// address embedded in a URL never touches `OpenSea`'s API, so it always
+/// comes back with `None` — only a slug lookup has a display name to give.
+pub(crate) async fn resolve_nft_contract_named(
     locator: &str,
     client: &reqwest::Client,
-) -> Result<Address, SnipeError> {
+) -> Result<(Address, Option<String>), SnipeError> {
     let trimmed = locator.trim();
     if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
         return trimmed
             .parse()
+            .map(|address| (address, None))
             .map_err(|_| SnipeError::InvalidCollection(trimmed.to_owned()));
     }
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -303,12 +308,21 @@ pub(crate) async fn resolve_nft_contract(
                 && (segment.starts_with("0x") || segment.starts_with("0X"))
                 && let Ok(address) = segment.parse()
             {
-                return Ok(address);
+                return Ok((address, None));
             }
         }
         return resolve_slug(&collection_slug_from_url(&url), client).await;
     }
     resolve_slug(trimmed, client).await
+}
+
+pub(crate) async fn resolve_nft_contract(
+    locator: &str,
+    client: &reqwest::Client,
+) -> Result<Address, SnipeError> {
+    resolve_nft_contract_named(locator, client)
+        .await
+        .map(|(address, _name)| address)
 }
 
 /// A bare slug URL (`/collection/<slug>`) ends in the slug, so taking the
@@ -331,7 +345,10 @@ fn collection_slug_from_url(url: &Url) -> String {
         .to_owned()
 }
 
-async fn resolve_slug(slug: &str, client: &reqwest::Client) -> Result<Address, SnipeError> {
+async fn resolve_slug(
+    slug: &str,
+    client: &reqwest::Client,
+) -> Result<(Address, Option<String>), SnipeError> {
     let mut request = client.get(format!("https://api.opensea.io/api/v2/collections/{slug}"));
     if let Ok(api_key) = std::env::var("OPENSEA_API_KEY")
         && !api_key.trim().is_empty()
@@ -383,9 +400,14 @@ async fn resolve_slug(slug: &str, client: &reqwest::Client) -> Result<Address, S
         .ok_or_else(|| {
             SnipeError::SlugLookup(format!("malformed contract entry for \"{slug}\""))
         })?;
-    address
+    let address = address
         .parse()
-        .map_err(|_| SnipeError::InvalidCollection(address.to_owned()))
+        .map_err(|_| SnipeError::InvalidCollection(address.to_owned()))?;
+    let name = json
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    Ok((address, name))
 }
 
 /// Endpoints whose host contains "sequencer" are send-only on Base and
@@ -732,37 +754,38 @@ pub async fn preview(options: &SnipeOptions) -> Result<SnipePreview, SnipeError>
 #[allow(clippy::too_many_lines)]
 pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
     let notify = options.notify.clone();
+    // Log-only during the run — full detail still lands in `railway logs` /
+    // stdout for debugging, but the chat only hears about the one thing it
+    // actually needs to know: emit_final!, sent exactly once at the end.
     macro_rules! emit_info {
         ($msg:expr) => {{
             let msg: String = $msg.into();
             logging::info(&msg);
-            if let Some(tx) = &notify {
-                let _ = tx.send(msg);
-            }
         }};
     }
     macro_rules! emit_success {
         ($msg:expr) => {{
             let msg: String = $msg.into();
             logging::success(&msg);
-            if let Some(tx) = &notify {
-                let _ = tx.send(msg);
-            }
         }};
     }
     macro_rules! emit_warn {
         ($msg:expr) => {{
             let msg: String = $msg.into();
             logging::warn(&msg);
-            if let Some(tx) = &notify {
-                let _ = tx.send(msg);
-            }
         }};
     }
     macro_rules! emit_error {
         ($msg:expr) => {{
             let msg: String = $msg.into();
             logging::error(&msg);
+        }};
+    }
+    macro_rules! emit_final {
+        ($msg:expr) => {{
+            let msg: String = $msg.into();
+            logging::section_break();
+            logging::success(&msg);
             if let Some(tx) = &notify {
                 let _ = tx.send(msg);
             }
@@ -789,7 +812,9 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
     // batch may mint a larger quantity and therefore cost more gas.
     let mut gas_limit = options.gas_limit.max(21_000);
     let read_client = reqwest::Client::new();
-    let nft_contract = resolve_nft_contract(&options.collection, &read_client).await?;
+    let (nft_contract, collection_name) =
+        resolve_nft_contract_named(&options.collection, &read_client).await?;
+    let collection_label = collection_name.unwrap_or_else(|| options.collection.clone());
     let candidates = resolve_rpc_candidates(&options.rpc_urls, options.chain.as_deref())?;
 
     let gateway = ChainGateway::new(READ_TIMEOUT)?;
@@ -1134,12 +1159,17 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
     }
 
     if accepted.is_empty() {
-        logging::error("NOTHING WAS BROADCAST — no receipts to wait for");
+        emit_final!(format!(
+            "❌ Nothing broadcast for {collection_label} — every wallet was rejected before reaching the chain. Check the logs for details."
+        ));
         return Ok(());
     }
 
     // ── Receipts (only for txs an endpoint actually accepted) ──
     emit_info!("Waiting for receipts...");
+    let mut minted = 0usize;
+    let mut on_chain_failed = 0usize;
+    let mut timed_out = 0usize;
     for (index, address, results) in &accepted {
         let tx_hash = results
             .iter()
@@ -1152,40 +1182,56 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
             wait_for_receipt(&gateway, &config, &tx_hash).await?
         };
         let landed_ms = dispatch_start.elapsed().as_millis();
-        match receipt {
-            Some(receipt) => {
-                let status = if receipt.is_success {
-                    "SUCCESS"
-                } else {
-                    "FAILED"
-                };
-                if receipt.is_success {
-                    emit_success!(format!(
-                        "[W{index}] {address} | block {} | {status} | time to landed {landed_ms}ms",
-                        receipt.block_number
-                    ));
-                } else {
-                    emit_error!(format!(
-                        "[W{index}] {address} | block {} | {status} | time to landed {landed_ms}ms",
-                        receipt.block_number
-                    ));
-                }
-                emit_info!(format!(
-                    "[W{index}] track: {}",
-                    explorer_url(chain_id, &tx_hash)
+        if let Some(receipt) = receipt {
+            let status = if receipt.is_success {
+                minted += 1;
+                "SUCCESS"
+            } else {
+                on_chain_failed += 1;
+                "FAILED"
+            };
+            if receipt.is_success {
+                emit_success!(format!(
+                    "[W{index}] {address} | block {} | {status} | time to landed {landed_ms}ms",
+                    receipt.block_number
+                ));
+            } else {
+                emit_error!(format!(
+                    "[W{index}] {address} | block {} | {status} | time to landed {landed_ms}ms",
+                    receipt.block_number
                 ));
             }
-            None => {
-                emit_warn!(format!(
-                    "[W{index}] TIMEOUT — check: {}",
-                    explorer_url(chain_id, &tx_hash)
-                ));
-            }
+            emit_info!(format!(
+                "[W{index}] track: {}",
+                explorer_url(chain_id, &tx_hash)
+            ));
+        } else {
+            timed_out += 1;
+            emit_warn!(format!(
+                "[W{index}] TIMEOUT — check: {}",
+                explorer_url(chain_id, &tx_hash)
+            ));
         }
     }
 
-    logging::section_break();
-    logging::success("LOCAL PUBLIC MINT COMPLETE");
+    let rejected_count = rejected.len();
+    emit_final!(match (minted, on_chain_failed, timed_out, rejected_count) {
+        (minted, 0, 0, 0) if minted > 0 => {
+            format!("✅ Minted {minted} × {collection_label}")
+        }
+        (0, _, _, _) => {
+            format!(
+                "❌ Minted 0 × {collection_label} — {on_chain_failed} reverted on-chain, \
+                 {timed_out} timed out, {rejected_count} never broadcast"
+            )
+        }
+        _ => {
+            format!(
+                "⚠️ Minted {minted} × {collection_label} — {on_chain_failed} reverted, \
+                 {timed_out} timed out, {rejected_count} never broadcast"
+            )
+        }
+    });
     Ok(())
 }
 

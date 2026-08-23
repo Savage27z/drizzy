@@ -14,21 +14,21 @@
 
 use std::{path::PathBuf, time::Duration};
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use rand_core::{OsRng, RngCore};
 use thiserror::Error;
 use tokio::{sync::mpsc::UnboundedSender, time::Instant};
 
 use crate::{
     blast,
-    chain::{ChainError, ChainGateway},
+    chain::{ChainError, ChainGateway, TransactionLog},
     config::ChainConfig,
     logging,
     multi_wallet::{WalletManifest, WalletManifestError},
     seadrop::{self, SeadropError},
     signing::{WalletSigner, WalletSignerError},
     snipe::{
-        SnipeError, chain_by_id, explorer_url, resolve_chain, resolve_nft_contract,
+        SnipeError, chain_by_id, explorer_url, resolve_chain, resolve_nft_contract_named,
         resolve_rpc_candidates, run_probe, unix_millis, wait_for_receipt, wait_until_fire,
     },
     sponsored::{
@@ -169,7 +169,8 @@ pub async fn preview(
 ) -> Result<SponsoredSnipePreview, SponsoredSnipeError> {
     let _ = dotenvy::dotenv();
     let read_client = reqwest::Client::new();
-    let nft_contract = resolve_nft_contract(&options.collection, &read_client).await?;
+    let (nft_contract, _name) =
+        resolve_nft_contract_named(&options.collection, &read_client).await?;
     let candidates = resolve_rpc_candidates(&options.rpc_urls, options.chain.as_deref())?;
     let gateway = ChainGateway::new(READ_TIMEOUT)?;
     let expected_chain_id = options
@@ -202,28 +203,26 @@ pub async fn run_sponsored_snipe(
     options: SponsoredSnipeOptions,
 ) -> Result<(), SponsoredSnipeError> {
     let notify = options.notify.clone();
+    // Log-only during the run — full detail still lands in `railway logs` /
+    // stdout for debugging, but the chat only hears about the one thing it
+    // actually needs to know: emit_final!, sent exactly once at the end.
     macro_rules! emit_info {
         ($msg:expr) => {{
             let msg: String = $msg.into();
             logging::info(&msg);
-            if let Some(tx) = &notify {
-                let _ = tx.send(msg);
-            }
         }};
     }
     macro_rules! emit_success {
         ($msg:expr) => {{
             let msg: String = $msg.into();
             logging::success(&msg);
-            if let Some(tx) = &notify {
-                let _ = tx.send(msg);
-            }
         }};
     }
-    macro_rules! emit_warn {
+    macro_rules! emit_final {
         ($msg:expr) => {{
             let msg: String = $msg.into();
-            logging::warn(&msg);
+            logging::section_break();
+            logging::success(&msg);
             if let Some(tx) = &notify {
                 let _ = tx.send(msg);
             }
@@ -235,7 +234,9 @@ pub async fn run_sponsored_snipe(
     // caveat: no independent "time to seen" without a third-party observer.
     let run_start = Instant::now();
     let read_client = reqwest::Client::new();
-    let nft_contract = resolve_nft_contract(&options.collection, &read_client).await?;
+    let (nft_contract, collection_name) =
+        resolve_nft_contract_named(&options.collection, &read_client).await?;
+    let collection_label = collection_name.unwrap_or_else(|| options.collection.clone());
     let candidates = resolve_rpc_candidates(&options.rpc_urls, options.chain.as_deref())?;
 
     let gateway = ChainGateway::new(READ_TIMEOUT)?;
@@ -517,6 +518,7 @@ pub async fn run_sponsored_snipe(
         ));
     }
 
+    let wallet_count = wallets.len();
     if blast::is_accepted(&results) {
         emit_success!(format!(
             "Batch accepted — tx {}",
@@ -527,29 +529,80 @@ pub async fn run_sponsored_snipe(
         let landed_ms = dispatch_start.elapsed().as_millis();
         match receipt_result {
             Ok(Some(receipt)) if receipt.is_success => {
-                emit_success!(format!(
-                    "Confirmed in block {} — time to landed {landed_ms}ms — check the executor's WalletExecution events for per-wallet results",
+                // The outer transaction reporting success only means the
+                // batch call itself didn't revert — one wallet failing
+                // doesn't revert the others, so that's not proof anything
+                // actually minted. Decode the executor's own per-wallet
+                // WalletExecution events for the real count.
+                let (minted, failed) = count_wallet_mints(options.executor, &receipt.logs);
+                emit_info!(format!(
+                    "Confirmed in block {} — time to landed {landed_ms}ms",
                     receipt.block_number
                 ));
+                emit_final!(match (minted, failed) {
+                    (minted, 0) if minted > 0 => {
+                        format!("✅ Minted {minted} × {collection_label}")
+                    }
+                    (0, _) => {
+                        format!(
+                            "❌ Minted 0 × {collection_label} — all {wallet_count} wallet(s) failed on-chain"
+                        )
+                    }
+                    (minted, failed) => {
+                        format!(
+                            "⚠️ Minted {minted} × {collection_label} — {failed} wallet(s) failed on-chain"
+                        )
+                    }
+                });
             }
             Ok(Some(receipt)) => {
-                emit_warn!(format!(
-                    "Included in block {} but reverted — time to landed {landed_ms}ms — nothing minted, wallet balances unchanged",
+                emit_final!(format!(
+                    "❌ Minted 0 × {collection_label} — batch reverted in block {} (time to landed {landed_ms}ms), wallet balances unchanged",
                     receipt.block_number
                 ));
             }
-            Ok(None) => emit_warn!(
-                "Accepted but not confirmed within the receipt timeout — check the explorer"
-                    .to_owned()
-            ),
-            Err(error) => emit_warn!(format!("Could not confirm receipt: {error}")),
+            Ok(None) => emit_final!(format!(
+                "⚠️ {collection_label}: batch accepted but not confirmed within the receipt timeout — check {}",
+                explorer_url(chain_id, &prepared.tx_hash.to_string())
+            )),
+            Err(error) => emit_final!(format!(
+                "⚠️ {collection_label}: batch accepted but receipt could not be confirmed: {error}"
+            )),
         }
     } else {
         let reasons = blast::rejection_reasons(&results);
-        emit_warn!(format!("Batch rejected by every RPC: {reasons:?}"));
+        emit_final!(format!(
+            "❌ Minted 0 × {collection_label} — batch rejected by every RPC: {reasons:?}"
+        ));
     }
 
     Ok(())
+}
+
+/// Decodes the executor's own `WalletExecution` events from a confirmed
+/// batch receipt to find out how many wallets *actually* minted. The outer
+/// transaction reporting success only means `executeBatch` itself didn't
+/// revert — a single wallet's mint failing is caught and skipped, not
+/// propagated, so it never shows up in the transaction's own status.
+fn count_wallet_mints(executor: Address, logs: &[TransactionLog]) -> (usize, usize) {
+    let signature = keccak256(b"WalletExecution(bytes32,address,address,uint256,bool,bytes4)");
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    for log in logs {
+        if log.address != executor || log.topics.first() != Some(&signature) {
+            continue;
+        }
+        // data = index (32 bytes) | success (32 bytes) | errorSelector (32 bytes)
+        let Some(success_word) = log.data.get(32..64) else {
+            continue;
+        };
+        if success_word.iter().any(|&byte| byte != 0) {
+            succeeded += 1;
+        } else {
+            failed += 1;
+        }
+    }
+    (succeeded, failed)
 }
 
 #[cfg(test)]
@@ -565,6 +618,47 @@ mod tests {
 
     fn key_for(byte: u8) -> String {
         format!("0x{:064x}", u128::from(byte))
+    }
+
+    fn wallet_execution_log(executor: Address, success: bool) -> TransactionLog {
+        let signature = keccak256(b"WalletExecution(bytes32,address,address,uint256,bool,bytes4)");
+        let mut data = vec![0_u8; 96];
+        data[63] = u8::from(success); // word1 (bytes 32..64): success bool
+        TransactionLog {
+            address: executor,
+            topics: vec![
+                signature,
+                B256::ZERO,
+                B256::ZERO,
+                B256::ZERO, // wallet — not read by count_wallet_mints
+            ],
+            data: data.into(),
+        }
+    }
+
+    #[test]
+    fn counts_real_mints_from_wallet_execution_events_not_outer_tx_status() {
+        let executor: Address = format!("0x{:040x}", 0xe1_u32).parse().expect("executor");
+        let other_contract: Address = format!("0x{:040x}", 0xaa_u32).parse().expect("other");
+        let logs = vec![
+            wallet_execution_log(executor, true),
+            wallet_execution_log(executor, false),
+            wallet_execution_log(executor, true),
+            // A log from some other contract with the same topic0 must be
+            // ignored — only the configured executor's own events count.
+            wallet_execution_log(other_contract, true),
+        ];
+        assert_eq!(count_wallet_mints(executor, &logs), (2, 1));
+    }
+
+    #[test]
+    fn counts_zero_mints_when_the_batch_never_actually_minted() {
+        let executor: Address = format!("0x{:040x}", 0xe1_u32).parse().expect("executor");
+        let logs = vec![
+            wallet_execution_log(executor, false),
+            wallet_execution_log(executor, false),
+        ];
+        assert_eq!(count_wallet_mints(executor, &logs), (0, 2));
     }
 
     fn manifest_with_wallet_count(count: usize) -> PathBuf {
