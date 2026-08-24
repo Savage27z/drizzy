@@ -533,24 +533,30 @@ pub async fn run_sponsored_snipe(
                 // batch call itself didn't revert — one wallet failing
                 // doesn't revert the others, so that's not proof anything
                 // actually minted. Decode the executor's own per-wallet
-                // WalletExecution events for the real count.
-                let (minted, failed) = count_wallet_mints(options.executor, &receipt.logs);
+                // WalletExecution events for the real count, in units
+                // (not wallets) so a quantity>1 batch reports honestly.
+                let wallet_quantities: std::collections::HashMap<Address, u64> = wallets
+                    .iter()
+                    .map(|(signer, quantity)| (signer.identity().address, *quantity))
+                    .collect();
+                let (units, failed) =
+                    count_minted_units(options.executor, &receipt.logs, &wallet_quantities);
                 emit_info!(format!(
                     "Confirmed in block {} — time to landed {landed_ms}ms",
                     receipt.block_number
                 ));
-                emit_final!(match (minted, failed) {
-                    (minted, 0) if minted > 0 => {
-                        format!("✅ Minted {minted} × {collection_label}")
+                emit_final!(match (units, failed) {
+                    (units, 0) if units > 0 => {
+                        format!("✅ Minted {units} × {collection_label}")
                     }
                     (0, _) => {
                         format!(
                             "❌ Minted 0 × {collection_label} — all {wallet_count} wallet(s) failed on-chain"
                         )
                     }
-                    (minted, failed) => {
+                    (units, failed) => {
                         format!(
-                            "⚠️ Minted {minted} × {collection_label} — {failed} wallet(s) failed on-chain"
+                            "⚠️ Minted {units} × {collection_label} — {failed} wallet(s) failed on-chain"
                         )
                     }
                 });
@@ -580,13 +586,21 @@ pub async fn run_sponsored_snipe(
 }
 
 /// Decodes the executor's own `WalletExecution` events from a confirmed
-/// batch receipt to find out how many wallets *actually* minted. The outer
+/// batch receipt to find out how many units *actually* minted. The outer
 /// transaction reporting success only means `executeBatch` itself didn't
 /// revert — a single wallet's mint failing is caught and skipped, not
 /// propagated, so it never shows up in the transaction's own status.
-fn count_wallet_mints(executor: Address, logs: &[TransactionLog]) -> (usize, usize) {
+///
+/// Returns (units minted, wallets that failed) — units, not wallet count,
+/// since each wallet can mint more than one unit and a "3 wallets succeeded"
+/// count would misreport a quantity-3 batch as minting 3 total instead of 9.
+fn count_minted_units(
+    executor: Address,
+    logs: &[TransactionLog],
+    wallet_quantities: &std::collections::HashMap<Address, u64>,
+) -> (u64, usize) {
     let signature = keccak256(b"WalletExecution(bytes32,address,address,uint256,bool,bytes4)");
-    let mut succeeded = 0usize;
+    let mut units = 0u64;
     let mut failed = 0usize;
     for log in logs {
         if log.address != executor || log.topics.first() != Some(&signature) {
@@ -597,12 +611,14 @@ fn count_wallet_mints(executor: Address, logs: &[TransactionLog]) -> (usize, usi
             continue;
         };
         if success_word.iter().any(|&byte| byte != 0) {
-            succeeded += 1;
+            let wallet = log.topics.get(3).copied().unwrap_or_default();
+            let wallet = Address::from_slice(&wallet[12..]);
+            units += wallet_quantities.get(&wallet).copied().unwrap_or(0);
         } else {
             failed += 1;
         }
     }
-    (succeeded, failed)
+    (units, failed)
 }
 
 #[cfg(test)]
@@ -620,45 +636,53 @@ mod tests {
         format!("0x{:064x}", u128::from(byte))
     }
 
-    fn wallet_execution_log(executor: Address, success: bool) -> TransactionLog {
+    fn wallet_execution_log(executor: Address, wallet: Address, success: bool) -> TransactionLog {
         let signature = keccak256(b"WalletExecution(bytes32,address,address,uint256,bool,bytes4)");
+        let mut wallet_topic = [0_u8; 32];
+        wallet_topic[12..].copy_from_slice(wallet.as_slice());
         let mut data = vec![0_u8; 96];
         data[63] = u8::from(success); // word1 (bytes 32..64): success bool
         TransactionLog {
             address: executor,
-            topics: vec![
-                signature,
-                B256::ZERO,
-                B256::ZERO,
-                B256::ZERO, // wallet — not read by count_wallet_mints
-            ],
+            topics: vec![signature, B256::ZERO, B256::ZERO, B256::from(wallet_topic)],
             data: data.into(),
         }
     }
 
     #[test]
-    fn counts_real_mints_from_wallet_execution_events_not_outer_tx_status() {
+    fn counts_minted_units_not_wallet_count_from_wallet_execution_events() {
         let executor: Address = format!("0x{:040x}", 0xe1_u32).parse().expect("executor");
         let other_contract: Address = format!("0x{:040x}", 0xaa_u32).parse().expect("other");
+        let wallet_a: Address = format!("0x{:040x}", 0x1_u32).parse().expect("wallet a");
+        let wallet_b: Address = format!("0x{:040x}", 0x2_u32).parse().expect("wallet b");
+        let wallet_c: Address = format!("0x{:040x}", 0x3_u32).parse().expect("wallet c");
+        // Mirrors the real bug found live: wallet_a minted quantity 3, not 1
+        // — a wallet-count-based tally would report "2" instead of "9".
+        let quantities: std::collections::HashMap<Address, u64> =
+            [(wallet_a, 3), (wallet_b, 3), (wallet_c, 3)].into();
         let logs = vec![
-            wallet_execution_log(executor, true),
-            wallet_execution_log(executor, false),
-            wallet_execution_log(executor, true),
+            wallet_execution_log(executor, wallet_a, true),
+            wallet_execution_log(executor, wallet_b, false),
+            wallet_execution_log(executor, wallet_c, true),
             // A log from some other contract with the same topic0 must be
             // ignored — only the configured executor's own events count.
-            wallet_execution_log(other_contract, true),
+            wallet_execution_log(other_contract, wallet_a, true),
         ];
-        assert_eq!(count_wallet_mints(executor, &logs), (2, 1));
+        assert_eq!(count_minted_units(executor, &logs, &quantities), (6, 1));
     }
 
     #[test]
-    fn counts_zero_mints_when_the_batch_never_actually_minted() {
+    fn counts_zero_units_when_the_batch_never_actually_minted() {
         let executor: Address = format!("0x{:040x}", 0xe1_u32).parse().expect("executor");
+        let wallet_a: Address = format!("0x{:040x}", 0x1_u32).parse().expect("wallet a");
+        let wallet_b: Address = format!("0x{:040x}", 0x2_u32).parse().expect("wallet b");
+        let quantities: std::collections::HashMap<Address, u64> =
+            [(wallet_a, 5), (wallet_b, 5)].into();
         let logs = vec![
-            wallet_execution_log(executor, false),
-            wallet_execution_log(executor, false),
+            wallet_execution_log(executor, wallet_a, false),
+            wallet_execution_log(executor, wallet_b, false),
         ];
-        assert_eq!(count_wallet_mints(executor, &logs), (0, 2));
+        assert_eq!(count_minted_units(executor, &logs, &quantities), (0, 2));
     }
 
     fn manifest_with_wallet_count(count: usize) -> PathBuf {
