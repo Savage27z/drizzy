@@ -95,6 +95,16 @@ const CHAINS: &[ChainProfile] = &[
             "https://sequencer.mainnet.chain.robinhood.com",
         ],
     },
+    ChainProfile {
+        key: "ink",
+        chain_id: 57_073,
+        explorer: "https://explorer.inkonchain.com",
+        alchemy_host: "ink-mainnet.g.alchemy.com",
+        public_rpcs: &[
+            "https://rpc-gel.inkonchain.com",
+            "https://rpc-qnd.inkonchain.com",
+        ],
+    },
 ];
 
 const DEFAULT_EXPLORER: &str = "https://basescan.org";

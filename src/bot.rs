@@ -705,6 +705,7 @@ async fn handle_natural_language(bot: &Arc<Bot>, chat_id: i64, text: &str) {
                     ("Base", "chain:base"),
                     ("Ethereum", "chain:ethereum"),
                     ("Robinhood", "chain:robinhood"),
+                    ("Ink", "chain:ink"),
                 ]],
             )
             .await;
@@ -786,7 +787,7 @@ async fn send_main_menu(bot: &Arc<Bot>, chat_id: i64) {
             &format!(
                 "*Drizzy — NFT Mint Sniper*\n\n\
                  Wallets: {wallet_count}\n\n\
-                 _Ethereum | Base | Robinhood Chain_"
+                 _Ethereum | Base | Robinhood Chain | Ink_"
             ),
             &[
                 &[("Snipe", "menu:snipe"), ("Wallets", "menu:wallets")],
@@ -1432,6 +1433,7 @@ async fn advance_wizard(bot: &Arc<Bot>, chat_id: i64, text: &str) {
                         ("Base", "chain:base"),
                         ("Ethereum", "chain:ethereum"),
                         ("Robinhood", "chain:robinhood"),
+                        ("Ink", "chain:ink"),
                     ]],
                 )
                 .await;
@@ -1527,6 +1529,7 @@ fn infer_chain_from_url(text: &str) -> Option<String> {
         "ethereum" | "eth" | "mainnet" => Some("ethereum".to_owned()),
         "base" => Some("base".to_owned()),
         "robinhood" => Some("robinhood".to_owned()),
+        "ink" => Some("ink".to_owned()),
         _ => None,
     }
 }
@@ -1563,6 +1566,7 @@ async fn start_from_locator(bot: &Arc<Bot>, chat_id: i64, locator: &str) {
                     ("Base", "chain:base"),
                     ("Ethereum", "chain:ethereum"),
                     ("Robinhood", "chain:robinhood"),
+                    ("Ink", "chain:ink"),
                 ]],
             )
             .await;

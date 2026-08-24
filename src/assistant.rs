@@ -159,7 +159,7 @@ fn tool_schema() -> Value {
                 },
                 "chain": {
                     "type": ["string", "null"],
-                    "enum": ["base", "ethereum", "robinhood", null],
+                    "enum": ["base", "ethereum", "robinhood", "ink", null],
                     "description": "Chain, if the operator named one or it is implied by an \
     OpenSea item URL. Null when unknown."
                 },

@@ -452,7 +452,7 @@ opensea-mint snipe --collection <COLLECTION> --chain <CHAIN> [--key <KEY>... | -
 | Parameter | Value | Default | Requirements |
 | --- | --- | --- | --- |
 | `--collection <COLLECTION>` | OpenSea slug, OpenSea collection URL, or NFT contract address | None | Must have a public stage on the SeaDrop singleton |
-| `--chain <CHAIN>` | `ethereum`, `base`, or `robinhood` | None (RPC chain ID is authoritative) | Used for public RPC defaults and Alchemy-key expansion |
+| `--chain <CHAIN>` | `ethereum`, `base`, `robinhood`, or `ink` | None (RPC chain ID is authoritative) | Used for public RPC defaults and Alchemy-key expansion |
 | `--key <KEY>` | Private key (repeatable) | None | At least one of `--key` or `--wallets` |
 | `--wallets <FILE>` | Path to a version-1 wallet manifest | None | Supports `--quantity` override and per-wallet manifest quantities |
 | `--rpc <URL>` | RPC endpoint (repeatable, all are blasted) | `.env` `RPC_URL`, then chain public nodes | HTTPS, except loopback |

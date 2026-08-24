@@ -125,7 +125,7 @@ pub enum Command {
         /// RPC endpoint to probe, read from, and blast to (repeatable).
         #[arg(long = "rpc", value_name = "URL")]
         rpc_urls: Vec<String>,
-        /// Chain key when no --rpc is given: ethereum, base, or robinhood.
+        /// Chain key when no --rpc is given: ethereum, base, robinhood, or ink.
         #[arg(long, value_name = "CHAIN")]
         chain: Option<String>,
         /// Max fee per gas in gwei (default: automatic from the chain).
