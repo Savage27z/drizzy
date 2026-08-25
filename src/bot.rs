@@ -1507,7 +1507,12 @@ fn looks_like_collection(text: &str) -> bool {
         return body.chars().all(|c| c.is_ascii_hexdigit());
     }
     let lowered = trimmed.to_ascii_lowercase();
-    (lowered.starts_with("https://") || lowered.starts_with("http://"))
+    // Telegram linkifies (and users happily paste) "opensea.io/..." with no
+    // scheme — recognize that too, not just "https://opensea.io/...".
+    (lowered.starts_with("https://")
+        || lowered.starts_with("http://")
+        || lowered.starts_with("opensea.io/")
+        || lowered.starts_with("www.opensea.io/"))
         && lowered.contains("opensea.io")
         && !trimmed.contains(char::is_whitespace)
 }

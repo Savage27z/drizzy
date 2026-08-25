@@ -310,9 +310,22 @@ pub(crate) async fn resolve_nft_contract_named(
             .map(|address| (address, None))
             .map_err(|_| SnipeError::InvalidCollection(trimmed.to_owned()));
     }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        let url =
-            Url::parse(trimmed).map_err(|_| SnipeError::InvalidCollection(trimmed.to_owned()))?;
+    // Telegram (and most chat apps) linkify and happily accept
+    // "opensea.io/collection/..." with no "https://" — treating that as a
+    // bare slug instead of a URL sends the *entire path* to OpenSea's API as
+    // a "slug" and fails with a confusing "no collection called
+    // opensea.io/collection/.../overview". Normalize it to a real URL first.
+    let has_scheme = trimmed.starts_with("http://") || trimmed.starts_with("https://");
+    let schemeless_opensea_link = !has_scheme
+        && (trimmed.starts_with("opensea.io/") || trimmed.starts_with("www.opensea.io/"));
+    if has_scheme || schemeless_opensea_link {
+        let normalized = if has_scheme {
+            trimmed.to_owned()
+        } else {
+            format!("https://{trimmed}")
+        };
+        let url = Url::parse(&normalized)
+            .map_err(|_| SnipeError::InvalidCollection(trimmed.to_owned()))?;
         for segment in url.path_segments().into_iter().flatten() {
             if segment.len() == 42
                 && (segment.starts_with("0x") || segment.starts_with("0X"))
@@ -1296,6 +1309,29 @@ mod tests {
                 "failed for {url}"
             );
         }
+    }
+
+    /// Telegram links "opensea.io/..." without a scheme, and users paste it
+    /// exactly like that. Missing the "https://" used to send the whole
+    /// path to `OpenSea`'s slug-lookup API verbatim instead of parsing it as a
+    /// URL — this exercises the address-in-path fast path, which needs no
+    /// network call, to confirm a scheme-less link is recognized at all.
+    #[tokio::test]
+    async fn resolves_a_schemeless_opensea_link_with_an_embedded_address() {
+        let client = reqwest::Client::new();
+        let (address, name) = resolve_nft_contract_named(
+            "opensea.io/assets/robinhood/0x1d6803470830c497D7651ffBEA287E2425d53094/1/overview",
+            &client,
+        )
+        .await
+        .expect("schemeless link with an embedded address resolves locally");
+        assert_eq!(
+            address,
+            "0x1d6803470830c497D7651ffBEA287E2425d53094"
+                .parse::<Address>()
+                .expect("address")
+        );
+        assert_eq!(name, None);
     }
 
     #[test]
